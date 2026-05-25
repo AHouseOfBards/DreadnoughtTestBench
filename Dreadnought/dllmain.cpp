@@ -4137,7 +4137,8 @@ void ProcessEventHook(UObject* object, UFunction* function, void* params) {
                                 //   4. Populate FWeakObjectPtr at tm+0x30 with live AYMenu
                                 // ----------------------------------------------------------------
                                 UObject** gmTmSlot = (UObject**)(gm + 0x09A8);
-                                if (*gmTmSlot == nullptr) {
+                                UObject* tm = *gmTmSlot;
+                                if (tm == nullptr) {
                                     // Try the BP subclass first, fall back to native class
                                     UClass* tmClass = UObject::FindObject<UClass>(
                                         "BlueprintGeneratedClass OutpostTransitionsManager_BP.OutpostTransitionsManager_BP_C");
@@ -4148,43 +4149,45 @@ void ProcessEventHook(UObject* object, UFunction* function, void* params) {
                                     if (tmClass) {
                                         printf("[HUD] Spawning OutpostTransitionManager using class: %s\n",
                                                ((UObject*)tmClass)->GetFullName().c_str());
-                                        UObject* tm = getLastOfType<UGameplayStatics>()->STATIC_SpawnObject(tmClass, (UObject*)(*UWorld::GWorld)->AuthorityGameMode);
+                                        tm = getLastOfType<UGameplayStatics>()->STATIC_SpawnObject(tmClass, (UObject*)(*UWorld::GWorld)->AuthorityGameMode);
                                         if (tm) {
                                             // Wire to GameMode+0x9A8
                                             *gmTmSlot = tm;
                                             printf("[HUD] Wired GameMode+0x9A8 (m_transitionManager) = %p (%s)\n",
                                                    tm, tm->GetFullName().c_str());
-
-                                            // Set m_fadeToBlackDuration at tm+0x2C (float, read by FUN_1403d0530)
-                                            *(float*)((uintptr_t)tm + 0x2C) = 1.0f;
-                                            printf("[HUD] Set tm+0x2C (m_fadeToBlackDuration) = 1.0f\n");
-
-                                            // Populate FWeakObjectPtr at tm+0x30 to point at GameMode (fixes crash inside FUN_1403bd800).
-                                            UObject* gmObj = (UObject*)(*UWorld::GWorld)->AuthorityGameMode;
-                                            if (gmObj) {
-                                                int32_t gmIndex = gmObj->InternalIndex;
-                                                FUObjectItem* gmItem = UObject::GObjects->GetItemByIndex(gmIndex);
-                                                if (gmItem) {
-                                                    *(int32_t*)((uintptr_t)tm + 0x30) = gmIndex;
-                                                    *(int32_t*)((uintptr_t)tm + 0x34) = gmItem->SerialNumber;
-                                                    printf("[HUD] Populated tm+0x30 FWeakObjectPtr with GameMode: index=%d serial=%d\n",
-                                                           gmIndex, gmItem->SerialNumber);
-                                                }
-                                            }
-                                            
-                                            // Correctly initialize the singly-linked queue to prevent null-dereference crash:
-                                            // Head is at tm + 0x78, Tail is at tm + 0x70 (should point to Head)
-                                            *(void**)((uintptr_t)tm + 0x78) = nullptr;
-                                            *(void**)((uintptr_t)tm + 0x70) = (void*)((uintptr_t)tm + 0x78);
-                                            printf("[HUD] Initialized transition queue: Head=nullptr, Tail=&Head\n");
                                         } else {
                                             printf("[HUD] WARNING: STATIC_SpawnObject returned null for transition manager\n");
                                         }
                                     } else {
-                                        printf("[HUD] WARNING: OutpostTransitionManager class not found â€” ScoutLight ships will crash\n");
+                                        printf("[HUD] WARNING: OutpostTransitionManager class not found — ScoutLight ships will crash\n");
                                     }
                                 } else {
-                                    printf("[HUD] GameMode+0x9A8 (m_transitionManager) already set: %p\n", *gmTmSlot);
+                                    printf("[HUD] GameMode+0x9A8 (m_transitionManager) already set: %p\n", tm);
+                                }
+
+                                if (tm) {
+                                    // Set m_fadeToBlackDuration at tm+0x2C (float, read by FUN_1403d0530)
+                                    *(float*)((uintptr_t)tm + 0x2C) = 1.0f;
+                                    printf("[HUD] Set tm+0x2C (m_fadeToBlackDuration) = 1.0f\n");
+
+                                    // Populate FWeakObjectPtr at tm+0x30 to point at GameMode (fixes crash inside FUN_1403bd800).
+                                    UObject* gmObj = (UObject*)(*UWorld::GWorld)->AuthorityGameMode;
+                                    if (gmObj) {
+                                        int32_t gmIndex = gmObj->InternalIndex;
+                                        FUObjectItem* gmItem = UObject::GObjects->GetItemByIndex(gmIndex);
+                                        if (gmItem) {
+                                            *(int32_t*)((uintptr_t)tm + 0x30) = gmIndex;
+                                            *(int32_t*)((uintptr_t)tm + 0x34) = gmItem->SerialNumber;
+                                            printf("[HUD] Populated tm+0x30 FWeakObjectPtr with GameMode: index=%d serial=%d\n",
+                                                   gmIndex, gmItem->SerialNumber);
+                                        }
+                                    }
+                                    
+                                    // Correctly initialize the singly-linked queue to prevent null-dereference crash:
+                                    // Head is at tm + 0x78, Tail is at tm + 0x70 (should point to Head)
+                                    *(void**)((uintptr_t)tm + 0x78) = nullptr;
+                                    *(void**)((uintptr_t)tm + 0x70) = (void*)((uintptr_t)tm + 0x78);
+                                    printf("[HUD] Initialized transition queue: Head=nullptr, Tail=&Head\n");
                                 }
                             } else {
                                 printf("[HUD] AuthorityGameMode is null â€” skipping GameMode wiring\n");
