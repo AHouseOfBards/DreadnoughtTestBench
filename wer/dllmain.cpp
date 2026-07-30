@@ -18,18 +18,18 @@ BOOL APIENTRY DllMain(HMODULE hModule,
     return TRUE;
 }
 
-__declspec (dllexport) extern "C" void WerReportAddFile() {
+extern "C" __declspec(dllexport) void WerReportAddFile() {
 
 }
 
-__declspec (dllexport) extern "C" void WerReportSubmit() {
+extern "C" __declspec(dllexport) void WerReportSubmit() {
 
 }
 
-__declspec (dllexport) extern "C" void WerReportSetParameter() {
+extern "C" __declspec(dllexport) void WerReportSetParameter() {
 
 }
 
-__declspec (dllexport) extern "C" void WerReportCreate() {
+extern "C" __declspec(dllexport) void WerReportCreate() {
 
 }
