@@ -119,6 +119,14 @@ The mod writes `dread_mod_log.txt` next to the executable. If that file appears
 and contains `[HOOK]` lines, the DLL is live. If there is no log file at all,
 the shim did not load.
 
+### No overlay
+
+If you are coming from upstream, note that **the ImGui overlay is gone** — there
+is no F7 menu. This fork drives the game's own screens instead, so bots, maps
+and loadouts are selected through the real UI rather than a debug window.
+`Present` is still hooked, because Steam's callback pump runs there, but it no
+longer draws anything.
+
 ---
 
 ## How this works

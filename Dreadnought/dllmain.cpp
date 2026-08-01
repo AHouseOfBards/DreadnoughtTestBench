@@ -1,4 +1,4 @@
-#define _CRT_SECURE_NO_WARNINGS
+﻿#define _CRT_SECURE_NO_WARNINGS
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -6,7 +6,8 @@
 #pragma comment(lib, "ws2_32.lib")
 #include "includes.h"
 #include "SDK.h"
-#include "imgui_stdlib.h"
+// MinHook is vendored inside kiero/, so this path stays even though kiero's
+// own D3D overlay hooking is no longer used for a UI.
 #include "kiero/minhook/include/MinHook.h"
 
 #define STEAM_API_EXPORTS
@@ -543,7 +544,7 @@ void PatchGCUnknownTokenCrash() {
 
     if (tokenStrAddr) {
 
-      // NOPping FatalError alone is insufficient â€” FMsg::Logf_Internal
+      // NOPping FatalError alone is insufficient Ã¢â‚¬â€ FMsg::Logf_Internal
       // with Fatal verbosity ALSO triggers the crash handler in UE4.
       // Binary analysis identified all 12 CALL sites (6 Logf + 6 FatalError
       // pairs).
@@ -591,7 +592,7 @@ void PatchGCUnknownTokenCrash() {
       printf("[GC] NOPped %d/%d Logf+FatalError call sites\n", nopCount,
              NUM_SITES);
 
-      // ROOT CAUSE FIX â€” After NOPping the Fatal+Logf calls, the code
+      // ROOT CAUSE FIX Ã¢â‚¬â€ After NOPping the Fatal+Logf calls, the code
       // at the default case falls through to a JMP back to the token processing
       // loop top (LAB_140d1c6d0). This causes an infinite loop because the
       // token stream pointer is invalid and every iteration AVs on the same bad
@@ -601,8 +602,8 @@ void PatchGCUnknownTokenCrash() {
       //   Line 1969: if ((uVar6 & 0xf00) != 0xb00)  // check for EndOfStream
       //   Line 1971-1975: FMsg::Logf + FatalError("Unknown token")  [NOPped
       //   above] Line 1976: goto LAB_140d1c6d0;             // JMP at 0xD1F233
-      //   â†’ loop back Line 1978+: EndOfStream handler            // at
-      //   0xD1F238 â†’ clean exit
+      //   Ã¢â€ â€™ loop back Line 1978+: EndOfStream handler            // at
+      //   0xD1F238 Ã¢â€ â€™ clean exit
       //
       // By NOPping this JMP, unknown tokens fall through to the EndOfStream
       // handler, which cleanly exits the token processing loop and advances to
@@ -621,7 +622,7 @@ void PatchGCUnknownTokenCrash() {
               VirtualProtect(jmpAddr, 5, PAGE_EXECUTE_READWRITE, &oldProt);
               memset(jmpAddr, 0x90, 5); // NOP the JMP
               VirtualProtect(jmpAddr, 5, oldProt, &oldProt);
-              printf("[GC] NOPped loop-back JMP â€” unknown tokens now exit "
+              printf("[GC] NOPped loop-back JMP Ã¢â‚¬â€ unknown tokens now exit "
                      "via EndOfStream\n");
             } else {
               printf("[GC] JMP at 0xD1F233: target mismatch (0x%llX != "
@@ -643,7 +644,7 @@ void PatchGCUnknownTokenCrash() {
 }
 
 // =============================================================================
-// Runtime GC disable â€” patch GarbageCollectionSettings CDO
+// Runtime GC disable Ã¢â‚¬â€ patch GarbageCollectionSettings CDO
 // The binary-level timer patch fails in shipping builds (CVar string stripped).
 // Instead, find the GarbageCollectionSettings CDO and patch the float directly.
 // Must be called AFTER UObjects are initialized (not at DLL load time).
@@ -679,7 +680,7 @@ void DisableGCAtRuntime() {
 
   // === Part B: Patch the UEngine's CACHED copy ===
   // UEngine::Init() copies TimeBetweenPurgingPendingKillObjects from CDO into a
-  // member. Patching the CDO alone doesn't help â€” the cached copy is already
+  // member. Patching the CDO alone doesn't help Ã¢â‚¬â€ the cached copy is already
   // set. Find the live YGameEngine instance and patch all 60.0f floats in it.
   UObject *gameEngine = nullptr;
   for (int i = 0; i < UObject::GObjects->Count(); i++) {
@@ -770,7 +771,7 @@ UPackage *LoadPackage(UObject *InOuter, const TCHAR *InLongPackageName,
                       uint32 LoadFlags) {
   uintptr_t addr = Globals::LoadPackageAddr ? Globals::LoadPackageAddr
                                             : (Globals::ModuleBase + 0xCF04B0);
-  // UE4 4.15 signature is (UPackage*, const TCHAR*, uint32, FArchive*) â€” 4
+  // UE4 4.15 signature is (UPackage*, const TCHAR*, uint32, FArchive*) Ã¢â‚¬â€ 4
   // args. The 4th arg (FArchive*) goes in R9. Passing nullptr explicitly to
   // avoid garbage in R9.
   return reinterpret_cast<UPackage *(*)(UObject *, const TCHAR *, uint32,
@@ -811,25 +812,9 @@ UObject *StaticLoadClassReconcile(UClass *ObjectClass, UObject *InOuter,
   return StaticLoadClass(ObjectClass, InOuter, InName);
 }
 
-/*
-        Startup IMGUI
-*/
-void InitImGui() {
-  ImGui::CreateContext();
-  ImGuiIO &io = ImGui::GetIO();
-  io.ConfigFlags = ImGuiConfigFlags_NoMouseCursorChange;
-  ImGui_ImplWin32_Init(window);
-  ImGui_ImplDX11_Init(pDevice, pContext);
-}
-
-LRESULT __stdcall WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam,
-                          LPARAM lParam) {
-
-  if (true && ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam))
-    return true;
-
-  return CallWindowProc(oWndProc, hWnd, uMsg, wParam, lParam);
-}
+// InitImGui and the WndProc subclass that fed it input lived here. Both are
+// gone with the overlay: the mod drives the game's own menus, so there is no
+// second UI to render and no reason to intercept window messages.
 
 typedef void(__thiscall *tProcessEvent)(UObject *, class UFunction *, void *);
 
@@ -1253,7 +1238,7 @@ void HostServerSetupThread(int botsT1, int botsT2, int diff, int loadout) {
   cachedLoadout = loadout;
   executeServerSetupOnMainThread = true;
 
-  // Apply loadout directly from background thread â€” same pattern as
+  // Apply loadout directly from background thread Ã¢â‚¬â€ same pattern as
   // singleplayer
   std::string loadoutPath = hostLoadoutPaths[loadout];
   Sleep(30 * 1000);
@@ -1277,7 +1262,7 @@ typedef UObject *(__cdecl *tStaticLoadObject_Global)(
     const wchar_t *Filename, uint32_t LoadFlags, void *Sandbox,
     bool bAllowObjectReconciliation);
 
-// LoadPackage typedef â€” simpler: (UPackage* InOuter, const TCHAR*
+// LoadPackage typedef Ã¢â‚¬â€ simpler: (UPackage* InOuter, const TCHAR*
 // InLongPackageName, uint32 LoadFlags)
 typedef UObject *(__cdecl *tLoadPackage)(UObject *InOuter,
                                          const wchar_t *InLongPackageName,
@@ -1342,7 +1327,7 @@ void InstallNativeHook(const char *funcName, void *hookFunc,
   // Guard: if already hooked (origFuncOut already set and != hookFunc), skip.
   // This prevents double-hooking when trying multiple name variants.
   if (origFuncOut && *origFuncOut != nullptr && *origFuncOut != hookFunc) {
-    // Already successfully hooked with a real original â€” skip
+    // Already successfully hooked with a real original Ã¢â‚¬â€ skip
     return;
   }
   UFunction *fn = (UFunction *)GetObjByName(funcName);
@@ -1718,11 +1703,11 @@ static bool bHasHookedIsItemOwnedByPlayer = false;
 static void *OriginalIsCurrentShipOwnedByPlayerFunc = nullptr;
 static bool bHasHookedIsCurrentShipOwnedByPlayer = false;
 
-// HasItem hooks — overrides item entitlement checks for hero ship vanity parts
+// HasItem hooks â€” overrides item entitlement checks for hero ship vanity parts
 typedef bool(__fastcall *tHasItemNative)(void *pThis, int32_t itemID);
 static tHasItemNative OrigHasItemNative = nullptr;
 
-// Exec thunk signature â€” see the install site in InitUIHooks for why.
+// Exec thunk signature Ã¢â‚¬â€ see the install site in InitUIHooks for why.
 static void *OrigHasItemNativeFunc = nullptr;
 
 void __fastcall MyHookHasItemNative(UObject *Context, void *Stack,
@@ -1751,7 +1736,7 @@ void __fastcall MyHookHasItemUFunction(UObject *Context, void *Stack, void *RESU
   }
 }
 
-// SetSelectedShip hooks — fires when user clicks a ship in various UI screens
+// SetSelectedShip hooks â€” fires when user clicks a ship in various UI screens
 static void *OriginalSetSelectedShipFunc =
     nullptr; // UI_ManufacturerTechTreeScreen
 static void *OriginalShipTechTreeSetSelectedShipFunc =
@@ -1878,7 +1863,7 @@ static uint8_t *g_ttmPtr = nullptr; // pointer to the live TTM UObject
 static CRITICAL_SECTION g_ttmLock;  // protects TTM wire/unwire
 static bool g_ttmLockInit = false;
 
-// UE4 allocator wrappers using DIRECT RVA calls â€” no vtable reconstruction
+// UE4 allocator wrappers using DIRECT RVA calls Ã¢â‚¬â€ no vtable reconstruction
 // needed.
 //
 // Confirmed from Ghidra analysis:
@@ -1893,12 +1878,12 @@ static bool g_ttmLockInit = false;
 // won't AV.
 static uintptr_t g_moduleBase = 0;
 
-// FMemory::Realloc(oldPtr, newSize, alignment) â€” RVA 0xC0ABD0
+// FMemory::Realloc(oldPtr, newSize, alignment) Ã¢â‚¬â€ RVA 0xC0ABD0
 // Called with oldPtr=NULL it behaves identically to Malloc.
 typedef void *(__fastcall *tUE4Realloc)(void *, size_t, uint32_t);
 static tUE4Realloc g_UE4Realloc = nullptr;
 
-// FMemory::Free(ptr) â€” RVA 0xBFC9C0
+// FMemory::Free(ptr) Ã¢â‚¬â€ RVA 0xBFC9C0
 typedef void(__fastcall *tUE4Free)(void *);
 static tUE4Free g_UE4Free = nullptr;
 
@@ -1917,7 +1902,7 @@ static void *UE4Malloc(size_t size) {
   }
   void *ptr = g_UE4Realloc(nullptr, size, 0); // 0 = DEFAULT_ALIGNMENT
   if (!ptr) {
-    printf("[ALLOC] UE4Malloc(%zu) FAILED â€” falling back to malloc\n", size);
+    printf("[ALLOC] UE4Malloc(%zu) FAILED Ã¢â‚¬â€ falling back to malloc\n", size);
     return malloc(size);
   }
   return ptr;
@@ -2006,7 +1991,7 @@ struct FleetTierRange {
 static FleetTierRange g_fleetTierRanges[8] = {};
 static int g_numFleetTierRanges = 0;
 
-// Audit tracer switch â€” see the [TRACE] block in ProcessEventHook.
+// Audit tracer switch Ã¢â‚¬â€ see the [TRACE] block in ProcessEventHook.
 static bool g_auditTraceEnabled = true;
 
 // Is [p, p+size) committed and writable right now?
@@ -2014,7 +1999,7 @@ static bool g_auditTraceEnabled = true;
 // Several hooks pull a struct pointer straight out of FFrame::Locals and write
 // through it, guarded by nothing but a null check. That is not enough: a
 // non-null pointer to a freed allocation passes the check and then faults on
-// write. Confirmed as the cause of the Owned Ships click crash â€” the fault was
+// write. Confirmed as the cause of the Owned Ships click crash Ã¢â‚¬â€ the fault was
 // a write at Dreadnought.dll+0x9B2C (mov [rax+8], ebp) through a stale
 // FYUIShipManufacturerTechItemData pointer, at the same address every run.
 // Is [p, p+size) committed and *readable*?
@@ -2070,7 +2055,7 @@ void ProcInMainThread(std::function<void()> Func);
 // before handing the selection on, so the ship detail panel and the purchase
 // data path ask about real cache IDs (0x01FF012E and friends). Ownership is
 // tracked purely in synthetic IDs, so a range check alone silently ignores
-// every detail-panel query â€” which is why an owned ship could show as needing
+// every detail-panel query Ã¢â‚¬â€ which is why an owned ship could show as needing
 // research while an unowned one showed as owned.
 static int32_t ResolveToSyntheticShipId(int32_t itemID) {
   if (itemID >= 11000 && itemID <= 19999)
@@ -2119,12 +2104,12 @@ static void ScanCacheForTiers() {
     uint8_t *entry = cacheData + i * CACHE_ENTRY_STRIDE;
 
     // SDK-verified offsets (FCachedItemIDDataEntry, size 0x118):
-    //   +0x0000: m_relatedItemIDs (TArray<FYRelatedItemEntry>) â€” NOT the item
-    //   ID +0x0010: m_uiData (FYItemUIData, size 0xD0) â€” contains FText
+    //   +0x0000: m_relatedItemIDs (TArray<FYRelatedItemEntry>) Ã¢â‚¬â€ NOT the item
+    //   ID +0x0010: m_uiData (FYItemUIData, size 0xD0) Ã¢â‚¬â€ contains FText
     //   m_headline at +0x00 +0x00F8: m_tier (int32_t) +0x00FC: m_itemID
-    //   (int32_t) â€” THE canonical item ID (e.g. 0x01FF0121) +0x0104:
-    //   m_cachedItemType (int32_t) â€” EYCachedItemType enum +0x010C:
-    //   m_loadoutItemType (uint8_t) +0x010D: m_shipClass (uint8_t) â€”
+    //   (int32_t) Ã¢â‚¬â€ THE canonical item ID (e.g. 0x01FF0121) +0x0104:
+    //   m_cachedItemType (int32_t) Ã¢â‚¬â€ EYCachedItemType enum +0x010C:
+    //   m_loadoutItemType (uint8_t) +0x010D: m_shipClass (uint8_t) Ã¢â‚¬â€
     //   EYShipClass enum
     int32_t itemId = *(int32_t *)(entry + 0xFC);        // m_itemID
     int32_t tierVal = *(int32_t *)(entry + 0xF8);       // m_tier
@@ -2154,7 +2139,7 @@ static void ScanCacheForTiers() {
       nameStr = "EXCEP";
     }
 
-    // Only log ships (ItemType==4) with valid tiers â€” skip the ~2800
+    // Only log ships (ItemType==4) with valid tiers Ã¢â‚¬â€ skip the ~2800
     // modules/weapons
     if (itemType == 4 && tierVal >= 1 && tierVal <= 5) {
       printf("[DISCOVERY]   Ship: 0x%08X T%d C%d \"%s\"\n", (uint32_t)itemId,
@@ -2496,7 +2481,7 @@ void BuildSyntheticToRealMap() {
         score += 20;
 
       // Name match: convert our wstring name to narrow string for comparison
-      // Cache may store "Dover (T2)" while our table has "Dover" â€” use
+      // Cache may store "Dover (T2)" while our table has "Dover" Ã¢â‚¬â€ use
       // contains check
       if (!entry.name.empty() && !ship.name.empty()) {
         // Convert ship.name (wstring) to narrow UTF-8 for comparison
@@ -2520,7 +2505,7 @@ void BuildSyntheticToRealMap() {
         if (cacheName == shipNameNarrow ||
             (cacheName.size() >= shipNameNarrow.size() &&
              cacheName.substr(0, shipNameNarrow.size()) == shipNameNarrow)) {
-          score += 50; // name match dominates â€” can't be beaten by class/tier
+          score += 50; // name match dominates Ã¢â‚¬â€ can't be beaten by class/tier
                        // alone
         }
       }
@@ -2592,10 +2577,10 @@ void BuildSyntheticToRealMap() {
           uint8_t identifier = pair.second;
           uint8_t *item = moduleData + idx * ITEM_ENTRY_SIZE;
 
-          // +0x20: item_id â€” the module's canonical cache ID
+          // +0x20: item_id Ã¢â‚¬â€ the module's canonical cache ID
           *(int32_t *)(item + 0x20) = modItemId;
 
-          // +0x2C: tier â€” look up from discovery cache if available
+          // +0x2C: tier Ã¢â‚¬â€ look up from discovery cache if available
           auto it = g_discoveryCache.find(modItemId);
           int32_t modTier =
               (it != g_discoveryCache.end()) ? it->second.tier : 1;
@@ -2662,7 +2647,7 @@ struct ShipDef {
   int proxyFallback;    // index into g_loadedShips for icon fallback
 };
 
-// Jupiter Arms â€” 17 ships (1â†’2â†’4â†’5â†’5)
+// Jupiter Arms Ã¢â‚¬â€ 17 ships (1Ã¢â€ â€™2Ã¢â€ â€™4Ã¢â€ â€™5Ã¢â€ â€™5)
 // Manufacturer confirmed from in-game ship descriptions
 static const ShipDef s_jupiterArms[] = {
     // T1: 1 ship
@@ -2704,7 +2689,7 @@ static const ShipDef s_jupiterArms[] = {
 static const int s_jupiterArmsCount =
     sizeof(s_jupiterArms) / sizeof(s_jupiterArms[0]);
 
-// Akula Vektor â€” 18 ships (2â†’2â†’4â†’5â†’5)
+// Akula Vektor Ã¢â‚¬â€ 18 ships (2Ã¢â€ â€™2Ã¢â€ â€™4Ã¢â€ â€™5Ã¢â€ â€™5)
 // Manufacturer confirmed from in-game ship descriptions
 static const ShipDef s_akulaVektor[] = {
     // T1: 2 ships
@@ -2748,7 +2733,7 @@ static const ShipDef s_akulaVektor[] = {
 static const int s_akulaVektorCount =
     sizeof(s_akulaVektor) / sizeof(s_akulaVektor[0]);
 
-// House Oberon â€” 17 ships (1â†’2â†’4â†’5â†’5)
+// House Oberon Ã¢â‚¬â€ 17 ships (1Ã¢â€ â€™2Ã¢â€ â€™4Ã¢â€ â€™5Ã¢â€ â€™5)
 // Manufacturer confirmed from in-game ship descriptions
 static const ShipDef s_oberon[] = {
     // T1: 1 ship
@@ -2873,8 +2858,8 @@ static uint8_t ComputeShipItemState(int32_t shipId) {
   // can express.
   //
   // The engine already holds the correct graph. GetTechTreeItemState
-  // (0x543890) walks a TArray<int32> of prerequisite item IDs at entry+0x10 â€”
-  // the same edges the UI draws its arrows from â€” and evaluates each one by
+  // (0x543890) walks a TArray<int32> of prerequisite item IDs at entry+0x10 Ã¢â‚¬â€
+  // the same edges the UI draws its arrows from Ã¢â‚¬â€ and evaluates each one by
   // asking whether it is researched/purchased. Those two questions are what
   // MyHookHasResearchedScan / MyHookHasPurchasedScan now answer from our
   // profile, so the engine derives the correct state by itself.
@@ -2959,7 +2944,7 @@ uint8_t __fastcall MyHookResolveTechTreeItemState(void *entry, void *worldCtx,
 // SetSelectedShip translates synthetic -> real before handing the selection
 // on, so the ship detail panel looks the ship up by its real cache ID. That
 // lookup misses, the caller is left holding a zeroed entry, and the state
-// resolver then sees itemID 0 and cannot answer â€” which is exactly the
+// resolver then sees itemID 0 and cannot answer Ã¢â‚¬â€ which is exactly the
 // "raw id 0x00000000 not a known ship" seen in the log on every ship click.
 //
 // Translating real -> synthetic here fixes every caller at once instead of
@@ -3037,7 +3022,7 @@ static std::wstring ReadFStringUE4(const void *fstringPtr) {
 // With no live catalog the game fills the XP fields with -1, and the tech tree
 // reports "Research Requirements Not Met" because a -1 requirement can never
 // be satisfied. We run a free-but-explicit economy offline, so every ship
-// costs nothing. The FString at 0x18 is deliberately left alone â€” it belongs
+// costs nothing. The FString at 0x18 is deliberately left alone Ã¢â‚¬â€ it belongs
 // to the engine.
 static void ZeroItemPriceData(uint8_t *price) {
   if (!price)
@@ -3053,7 +3038,7 @@ static void ZeroItemPriceData(uint8_t *price) {
 // synthetic ship ID. The owned-ships screen has to build its array by hand
 // (the engine only ever returns entries for ships the dead server knew about),
 // and leaving these empty is what produces nameless white boxes. Deep copies,
-// not raw pointers â€” the engine owns and frees the originals.
+// not raw pointers Ã¢â‚¬â€ the engine owns and frees the originals.
 struct FShipUiStrings {
   std::wstring iconPath;
   std::wstring categoryImagePath;
@@ -3235,7 +3220,7 @@ static int g_numLoadedClasses = 0;
 uint64_t __fastcall MyHookGetManufacturerData(int32_t manufacturerId,
                                               void *outArr1, void *outArr2,
                                               void *worldContext) {
-  // TTM is now permanently populated (GC root cause fixed â€” unknown tokens
+  // TTM is now permanently populated (GC root cause fixed Ã¢â‚¬â€ unknown tokens
   // exit cleanly via EndOfStream). No more temporary wire/unwire needed.
   uint64_t result =
       OrigGetManufacturerData(manufacturerId, outArr1, outArr2, worldContext);
@@ -3318,7 +3303,7 @@ uint64_t __fastcall MyHookGetManufacturerData(int32_t manufacturerId,
               // hardcoded to 3 (Researched) for every ship, which made all 52
               // look unlocked and suppressed the purchase button. Non-owned
               // ships keep whatever GetTechTreeItemState computed from the
-              // real prerequisite graph â€” overwriting that here would throw
+              // real prerequisite graph Ã¢â‚¬â€ overwriting that here would throw
               // away the engine's answer.
               if (g_ownedShips.count(itemID) > 0)
                 *(uint8_t *)(item + 0x40) =
@@ -3433,7 +3418,7 @@ uint64_t __fastcall MyHookGetShipResearchData(int32_t shipId, void *outArr1,
         return 1;
       }
     }
-    // Failsafe: don't return 0 for synthetic â€” return success to prevent BP
+    // Failsafe: don't return 0 for synthetic Ã¢â‚¬â€ return success to prevent BP
     // errors
     static int synthLog = 0;
     if (synthLog < 5) {
@@ -3489,7 +3474,7 @@ uint64_t __fastcall MyHookGetShipResearchData(int32_t shipId, void *outArr1,
 }
 
 // ========================================================================
-// OnResearchTechTreeItem â€” intercepting ship research/purchase requests
+// OnResearchTechTreeItem Ã¢â‚¬â€ intercepting ship research/purchase requests
 // The game calls this when the player clicks "Research" or "Buy" on a ship.
 // Without a server, the original function fails. We intercept and auto-succeed.
 // ========================================================================
@@ -3522,7 +3507,7 @@ void __fastcall MyHookOnResearchTechTreeItem(UObject *Context, void *Stack,
     *(bool *)RESULT_DECL = true;
   }
 
-  printf("[UI] OnResearchTechTreeItem called â€” auto-approved\n");
+  printf("[UI] OnResearchTechTreeItem called Ã¢â‚¬â€ auto-approved\n");
 }
 
 // Phase 3.3: ComposeModuleUiDataForShip Hooks
@@ -3635,7 +3620,7 @@ FShipInfo GetShipInfoRegistry(int32_t shipClass, int32_t tier,
 static void *OriginalGetManufacturersDataFunc_BP = nullptr;
 void __fastcall MyHookGetManufacturersData(UObject *Context, void *Stack,
                                            void *RESULT_DECL) {
-  // Call original first â€” it may partially work
+  // Call original first Ã¢â‚¬â€ it may partially work
   typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
   if (OriginalGetManufacturersDataFunc_BP) {
     ((OrigFunc)OriginalGetManufacturersDataFunc_BP)(Context, Stack,
@@ -3659,7 +3644,7 @@ void __fastcall MyHookGetManufacturersData(UObject *Context, void *Stack,
     return;
   }
 
-  // Original returned empty â€” read from Default__GlobalUI_C CDO
+  // Original returned empty Ã¢â‚¬â€ read from Default__GlobalUI_C CDO
   static UObject *cachedUIData = nullptr;
   if (!cachedUIData) {
     cachedUIData =
@@ -3717,7 +3702,7 @@ void __fastcall MyHookGetUIShipData(UObject *Context, void *Stack,
 
     // A null check alone is not sufficient here. This pointer comes out of the
     // Blueprint frame and can reference an array the engine has already freed
-    // â€” clicking a ship on the Owned Ships screen (whose filter widget owns
+    // Ã¢â‚¬â€ clicking a ship on the Owned Ships screen (whose filter widget owns
     // this UFunction) reliably produced a write fault at the same address on
     // every run. Verify the whole struct is committed and writable first.
     if (pData && !IsWritableMemory(pData, sizeof(FYUIShipManufacturerTechItemData))) {
@@ -3814,7 +3799,7 @@ void __fastcall MyHookGetUIShipData(UObject *Context, void *Stack,
       }
 
       // manufacturer IDs are 0-based (0=JA, 1=AV, 2=OB)
-      // No need to force manufacturer ID â€” 0 is valid
+      // No need to force manufacturer ID Ã¢â‚¬â€ 0 is valid
       if ((uint8_t)pData->m_shipClass == 13) {
         pData->m_shipClass =
             (EYShipClass)12; // Temporarily map to Support Medium for UI lookup
@@ -4036,7 +4021,7 @@ void ProcessSetSelectedShip(UObject *Context, void *Stack, void *RESULT_DECL,
     // CRITICAL: Replace synthetic ID with real cache ID in Locals BEFORE
     // calling original. The Blueprint handler internally calls native functions
     // (GetTier, etc.) with this ID. Synthetic IDs don't exist in the cache,
-    // so they return tier=0 â†’ TierColors[0-1] â†’ index -1 crash.
+    // so they return tier=0 Ã¢â€ â€™ TierColors[0-1] Ã¢â€ â€™ index -1 crash.
     // The real cache ID has proper tier/class/module data.
     if (realID != 0 && locals) {
       *(int32_t *)(locals + 0x10) = realID;
@@ -4158,8 +4143,8 @@ void ProcessSetSelectedShip(UObject *Context, void *Stack, void *RESULT_DECL,
 
   // NOTE: Do NOT restore the synthetic ID. The Blueprint has consumed locals
   // and deferred rendering events (TierColors, GetTier) still hold a reference
-  // to this buffer. Restoring synthetic ID here causes tier=0 â†’
-  // TierColors[-1]. FindCachedDataEntry already translates synthâ†’real for any
+  // to this buffer. Restoring synthetic ID here causes tier=0 Ã¢â€ â€™
+  // TierColors[-1]. FindCachedDataEntry already translates synthÃ¢â€ â€™real for any
   // future lookups.
 }
 
@@ -4225,7 +4210,7 @@ void __fastcall MyHookGetShipData(UObject *Context, void *Stack,
           ZeroItemPriceData(pResult + UIITEM_PURCHASEPRICE);
           InitFStringUE4(pResult + 0x10, s.name.c_str()); // m_name (FString)
 
-          // Track the last synthetic ship queried â€” this is how we identify
+          // Track the last synthetic ship queried Ã¢â‚¬â€ this is how we identify
           // the selected ship since SetSelectedShip can't read FFrame params
           if (g_loadoutSwitchPending) {
             g_lastClickedSyntheticId = itemID;
@@ -4442,7 +4427,7 @@ UObject *__fastcall MyHookGetUObjectFromWeakPtr(void *pWeakPtr) {
 // Our fix: pre-validate the delegate pointer and each entry's weak pointer
 // BEFORE calling the original. If any weak ptr resolves to null, zero the FName
 // field so the original function's internal FindFunction check will skip it
-// (FName=0 â†’ not found â†’ skip).
+// (FName=0 Ã¢â€ â€™ not found Ã¢â€ â€™ skip).
 typedef void(__fastcall *tProcessMulticastDelegate)(void *pDelegate,
                                                     void *pParameters);
 static tProcessMulticastDelegate OrigProcessMulticastDelegate = nullptr;
@@ -4457,7 +4442,7 @@ void __fastcall MyHookProcessMulticastDelegate(void *pDelegate,
   __try {
     volatile int32_t numEntries = *(int32_t *)((uint8_t *)pDelegate + 0x08);
     if (numEntries <= 0 || numEntries > 1024) {
-      // Probably garbage â€” skip entirely
+      // Probably garbage Ã¢â‚¬â€ skip entirely
       return;
     }
 
@@ -4481,16 +4466,16 @@ void __fastcall MyHookProcessMulticastDelegate(void *pDelegate,
         // Try to resolve the weak pointer
         UObject *obj = OrigGetUObjectFromWeakPtr(entry);
         if (!obj) {
-          // Dead weak pointer â€” zero the FName so original function skips it
+          // Dead weak pointer Ã¢â‚¬â€ zero the FName so original function skips it
           *(uint64_t *)(entry + 0x08) = 0;
         }
       }
     }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
-    // Delegate memory is corrupt â€” don't call original
+    // Delegate memory is corrupt Ã¢â‚¬â€ don't call original
     static int logLimit = 0;
     if (logLimit++ < 5) {
-      printf("[DELEGATE] SEH caught corrupt delegate %p â€” skipping\n",
+      printf("[DELEGATE] SEH caught corrupt delegate %p Ã¢â‚¬â€ skipping\n",
              pDelegate);
     }
     return;
@@ -4909,7 +4894,7 @@ void __fastcall MyHookIsItemOwnedByPlayer(UObject *Context, void *Stack,
   }
 
   // Only speak when we positively recognise the item. This used to default to
-  // "owned = true", so any item whose ID could not be read reported as owned â€”
+  // "owned = true", so any item whose ID could not be read reported as owned Ã¢â‚¬â€
   // which is why unowned ships such as Machias displayed OWNED.
   int32_t synth = ResolveToSyntheticShipId(itemId);
   if (synth > 0) {
@@ -5287,7 +5272,7 @@ void InjectOfflineFleet(AYPlayerController *pc) {
          (int)loadedClasses.size());
 
   // Register ALL loaded classes with the engine's loadout system.
-  // This is how the game normally registers loadouts â€” it takes a UClass*
+  // This is how the game normally registers loadouts Ã¢â‚¬â€ it takes a UClass*
   // (BlueprintGeneratedClass) and internally constructs a UYShipLoadout
   // instance, populating all fields correctly (precastID, tier, manufacturer,
   // modules, etc).
@@ -5440,7 +5425,7 @@ void InjectOfflineFleet(AYPlayerController *pc) {
           }
 
           // Extract tier from loadout class name (e.g.,
-          // "VH_AssaultMedium_T3_..." â†’ 3) Offset +0xD0 was reading garbage
+          // "VH_AssaultMedium_T3_..." Ã¢â€ â€™ 3) Offset +0xD0 was reading garbage
           // (425). The class name always contains _T{N}_.
           int loadoutTier = 1; // default
           try {
@@ -5816,7 +5801,7 @@ void InjectOfflineFleet(AYPlayerController *pc) {
       if (dstArray->Count > 0 && dstArray->Count < 100 && dstArray->Data &&
           (uintptr_t)dstArray->Data > 0x10000 &&
           !IsBadReadPtr(dstArray->Data, dstArray->Count * ENTRY_SIZE)) {
-        printf("[UI] %s already has %d manufacturer entries â€” using existing "
+        printf("[UI] %s already has %d manufacturer entries Ã¢â‚¬â€ using existing "
                "data\n",
                label, dstArray->Count);
         // Log the IDs to verify
@@ -5932,7 +5917,7 @@ void InjectOfflineFleet(AYPlayerController *pc) {
         printf("[UI] Found m_globalData at offset 0x%04X: %s\n", foundOffset,
                globalDataClass->GetFullName().c_str());
 
-        // Get the CDO of this class â€” this is the actual UYUIData instance
+        // Get the CDO of this class Ã¢â‚¬â€ this is the actual UYUIData instance
         // with serialized data
         UObject *globalDataCDO = globalDataClass->CreateDefaultObject();
         if (globalDataCDO) {
@@ -6177,7 +6162,7 @@ void InjectOfflineFleet(AYPlayerController *pc) {
       if (dstArray->Count > 0 && dstArray->Count < 100 && dstArray->Data &&
           (uintptr_t)dstArray->Data > 0x10000 &&
           !IsBadReadPtr(dstArray->Data, dstArray->Count * ENTRY_SIZE)) {
-        printf("[UI] %s already has %d manufacturer entries â€” verifying\n",
+        printf("[UI] %s already has %d manufacturer entries Ã¢â‚¬â€ verifying\n",
                label, dstArray->Count);
         for (int i = 0; i < dstArray->Count && i < 5; i++) {
           int32_t id = *(int32_t *)(dstArray->Data + (i * ENTRY_SIZE) + 0xA0);
@@ -6272,7 +6257,7 @@ void InjectOfflineFleet(AYPlayerController *pc) {
         }
       } else {
         printf(
-            "[UI] PC.m_globalData is NULL or invalid â€” needs population!\n");
+            "[UI] PC.m_globalData is NULL or invalid Ã¢â‚¬â€ needs population!\n");
         // If empty, try to populate with the GlobalUI_C class
         if (srcMfgOwner) {
           // srcMfgOwner is Default__GlobalUI_C - find its class
@@ -6299,7 +6284,7 @@ void InjectOfflineFleet(AYPlayerController *pc) {
           // (AYMenu)", srcMfgArray);
         }
       } else {
-        printf("[UI] PC.m_outpostHUD is NULL â€” no live AYMenu from PC\n");
+        printf("[UI] PC.m_outpostHUD is NULL Ã¢â‚¬â€ no live AYMenu from PC\n");
       }
     }
 
@@ -6376,7 +6361,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
         // before the fault is ShipFocused, so widen coverage to whatever the
         // click path touches next.
         "Loadout",  "Focus",    "Select",  "Detail",
-        // Fleet management â€” the next milestone. UYFleetManager waits on
+        // Fleet management Ã¢â‚¬â€ the next milestone. UYFleetManager waits on
         // HandleMmogbrainAddedToFleet, a server callback that can never
         // arrive offline, so find what the screen really calls.
         "Fleet",    "Flagship", "AddShip", "Slot",
@@ -6426,7 +6411,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
   //     UI_EditShip_Panel_ShipDetails_C.OnPurchaseShip
   //
   // The Blueprint raises the purchase intent correctly and then has nobody to
-  // ask â€” the transaction lived on Mmogbrain. We settle it locally instead.
+  // ask Ã¢â‚¬â€ the transaction lived on Mmogbrain. We settle it locally instead.
   //
   // g_lastClickedSyntheticId is refreshed by ProcessSetSelectedShip on every
   // ship click, immediately before this panel is built, so it identifies the
@@ -6800,7 +6785,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
            object->GetFullName().c_str());
   }
 
-  // === 2. HandleHangarStateUpdate â€” hangar level is loaded, trigger fleet
+  // === 2. HandleHangarStateUpdate Ã¢â‚¬â€ hangar level is loaded, trigger fleet
   // injection ===
   static bool g_techTreeInspected = false;
   if (funcName.find("HandleHangarStateUpdate") != std::string::npos &&
@@ -6815,7 +6800,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
     // Tech Tree Population via Native Engine Functions
     // Strategy: Probe the pipeline with real engine functions to understand
     // the data state, then call native parsers to populate structures.
-    // NO raw byte writes to complex structs â€” let the engine handle layout.
+    // NO raw byte writes to complex structs Ã¢â‚¬â€ let the engine handle layout.
     // =====================================================================
 
     // Find the live YTechTreeManager
@@ -6964,7 +6949,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                 uint8_t *item = itemsData + i * ITEM_ENTRY_SIZE;
                 const FTechTreeShip &ship = g_FullTechTree[globalShipIdx];
 
-                // +0x20: item_id â€” unique synthetic ID
+                // +0x20: item_id Ã¢â‚¬â€ unique synthetic ID
                 *(int32_t *)(item + 0x20) = ship.shipId;
                 // +0x2C: tier (1-5)
                 *(int32_t *)(item + 0x2C) = ship.tier;
@@ -7030,7 +7015,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                      itemsData);
             }
 
-            // Permanently populate TTM â€” safe now that the GC
+            // Permanently populate TTM Ã¢â‚¬â€ safe now that the GC
             // root cause is fixed (unknown tokens exit via EndOfStream).
             // GetHeroShipsFromManufacturerData needs data in TTM+0x38
             // at all times, not just during GetManufacturerData calls.
@@ -7067,10 +7052,10 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                   uint8_t identifier = pair.second;
                   uint8_t *item = moduleData + idx * ITEM_ENTRY_SIZE;
 
-                  // +0x20: item_id â€” the module's canonical cache ID
+                  // +0x20: item_id Ã¢â‚¬â€ the module's canonical cache ID
                   *(int32_t *)(item + 0x20) = modItemId;
 
-                  // +0x2C: tier â€” look up from discovery cache if available
+                  // +0x2C: tier Ã¢â‚¬â€ look up from discovery cache if available
                   auto it = g_discoveryCache.find(modItemId);
                   if (it != g_discoveryCache.end()) {
                     *(int32_t *)(item + 0x2C) = it->second.tier;
@@ -7149,7 +7134,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
              arr48->Count, arr58->Count);
     }
 
-    // Inject fleet data NOW â€” get PC from GWorld the reliable way
+    // Inject fleet data NOW Ã¢â‚¬â€ get PC from GWorld the reliable way
     if (!g_fleetInjected) {
       try {
         ULocalPlayer *lp =
@@ -7161,7 +7146,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
           // ================================================================
           // PRE-FLEET INIT: Wire m_player + call InitializeOutpostShip
           // BEFORE fleet injection so fleet is empty when InitializeOutpostShip
-          // runs. FUN_14034dff0 returns false (no flagship yet) â†’ only binds
+          // runs. FUN_14034dff0 returns false (no flagship yet) Ã¢â€ â€™ only binds
           // delegates on fleet_obj+0x70 and +0x90. No crash. No immediate
           // ship loading. Later, PlayerFlagshipChanged will trigger loading.
           // ================================================================
@@ -7199,11 +7184,11 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
             }
 
             // 3. Call InitializeOutpostShip BEFORE fleet injection.
-            // Fleet is empty â†’ FUN_14034dff0 returns 0 â†’ binds delegates
+            // Fleet is empty Ã¢â€ â€™ FUN_14034dff0 returns 0 Ã¢â€ â€™ binds delegates
             // ONLY. Camera sections TMap (GameMode+0xA38) is NOT populated here
             // yet. We deliberately defer OnHudAvailable to AFTER pfcNative so
-            // that FUN_140372640 returns null (cameras empty) â†’ FUN_1403d1990
-            // not called â†’ avoids crash in FUN_1403bd800 (tm+0x30 null
+            // that FUN_140372640 returns null (cameras empty) Ã¢â€ â€™ FUN_1403d1990
+            // not called Ã¢â€ â€™ avoids crash in FUN_1403bd800 (tm+0x30 null
             // TArray).
             {
               UFunction *initShipFn = (UFunction *)GetObjByName(
@@ -7229,28 +7214,28 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
           // ROOT CAUSE ANALYSIS (FUN_1403bd800 crash):
           //   FUN_1403bd800(tm) calls FUN_140d6ad50(tm+0x30) to get an object.
           //   It then calls vtable+0x108 (= GetWorld()) on that object.
-          //   tm+0x30 is a backpointer to GameMode â€” null offline because
+          //   tm+0x30 is a backpointer to GameMode Ã¢â‚¬â€ null offline because
           //   the transition manager's BeginPlay/init never ran.
           //   FIX: wire tm+0x30 = GameMode before calling pfcNative.
           //   With GameMode wired: GetWorld() works, finds 0 current ships,
-          //   FUN_1403bd800 returns cleanly, FUN_1403835b0 fires â†’ ship
+          //   FUN_1403bd800 returns cleanly, FUN_1403835b0 fires Ã¢â€ â€™ ship
           //   shows.
           //
           // SEQUENCE:
           //   1. Wire tm+0x30 = GameMode
-          //   2. OnHudAvailable â†’ camera sections TMap populated
-          //   3. pfcNative â†’ FUN_140384d80 â†’ FUN_140372640(cameras ready)
-          //   â†’
-          //      FUN_1403d1990(tm, section, 1) â†’ FUN_1403bd800(tm) â†’ clean
-          //      â†’ FUN_1403835b0(GameMode, section) â†’ FUN_1403cd3c0(tm,
-          //      section) â†’ ship streams in and appears in viewport!
+          //   2. OnHudAvailable Ã¢â€ â€™ camera sections TMap populated
+          //   3. pfcNative Ã¢â€ â€™ FUN_140384d80 Ã¢â€ â€™ FUN_140372640(cameras ready)
+          //   Ã¢â€ â€™
+          //      FUN_1403d1990(tm, section, 1) Ã¢â€ â€™ FUN_1403bd800(tm) Ã¢â€ â€™ clean
+          //      Ã¢â€ â€™ FUN_1403835b0(GameMode, section) Ã¢â€ â€™ FUN_1403cd3c0(tm,
+          //      section) Ã¢â€ â€™ ship streams in and appears in viewport!
           // ================================================================
           {
             uintptr_t gm = (uintptr_t)(*UWorld::GWorld)->AuthorityGameMode;
             UObject *gm_obj = (UObject *)(*UWorld::GWorld)->AuthorityGameMode;
 
-            // â”€â”€ Collect loadout FName (same probe as before)
-            // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            // Ã¢â€â‚¬Ã¢â€â‚¬ Collect loadout FName (same probe as before)
+            // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             void *fleetObj = *(void **)((uintptr_t)pc + 0x958);
             printf("[FLAG] pc->m_fleetManager = %p\n", pc->m_fleetManager);
             printf("[FLAG] PC+0x958 fleet_obj  = %p\n", fleetObj);
@@ -7293,7 +7278,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
               printf("[FLAG] Found flagship FName=0x%016llX\n",
                      foundFlagshipFName);
             } else {
-              printf("[FLAG] No loadout FName found â€” flagship not set.\n");
+              printf("[FLAG] No loadout FName found Ã¢â‚¬â€ flagship not set.\n");
             }
           }
 
@@ -7339,7 +7324,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
               // ----------------------------------------------------------------
               // Offline: VH_YMenu_Outpost_BP_C is never placed in the level
               // because the server (AYGameMode_Outpost) never fires BeginPlay.
-              // A CDO is NOT sufficient â€” AYMenu is referenced by 43+
+              // A CDO is NOT sufficient Ã¢â‚¬â€ AYMenu is referenced by 43+
               // functions and needs full UE4 actor lifecycle (BeginPlay, Tick,
               // components).
               //
@@ -7402,7 +7387,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                     }
                   }
                 } else {
-                  printf("[HUD] SpawnActor returned null â€” falling back to "
+                  printf("[HUD] SpawnActor returned null Ã¢â‚¬â€ falling back to "
                          "CDO\n");
                   foundMenu = UObject::FindObject<UObject>(
                       "YMenu DreadGame.Default__YMenu");
@@ -7411,7 +7396,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                   }
                 }
               } else {
-                printf("[HUD] AYMenu class not found â€” will retry on next "
+                printf("[HUD] AYMenu class not found Ã¢â‚¬â€ will retry on next "
                        "event\n");
               }
             }
@@ -7455,8 +7440,8 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                 // When any ScoutLight (class 2) ship is clicked in the tech
                 // tree, the game calls
                 // FUN_1403d0530(GameMode->m_transitionManager, ...). If
-                // m_transitionManager == null â†’ immediate crash. If non-null
-                // but FWeakObjectPtr at +0x30 doesn't resolve â†’ crash inside
+                // m_transitionManager == null Ã¢â€ â€™ immediate crash. If non-null
+                // but FWeakObjectPtr at +0x30 doesn't resolve Ã¢â€ â€™ crash inside
                 // FUN_140372640 when it dereferences param_1+0xA38 (which is
                 // AYMenu::m_visualAttractionModeMap).
                 //
@@ -7497,7 +7482,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                     }
                   } else {
                     printf("[HUD] WARNING: OutpostTransitionManager class not "
-                           "found — ScoutLight ships will crash\n");
+                           "found â€” ScoutLight ships will crash\n");
                   }
                 } else {
                   printf("[HUD] GameMode+0x9A8 (m_transitionManager) already "
@@ -7547,7 +7532,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                   }
                 }
               } else {
-                printf("[HUD] AuthorityGameMode is null â€” skipping GameMode "
+                printf("[HUD] AuthorityGameMode is null Ã¢â‚¬â€ skipping GameMode "
                        "wiring\n");
               }
 
@@ -7556,14 +7541,14 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
               // ----------------------------------------------------------------
               // CRITICAL INSIGHT from decompile of FUN_140374240:
               //   InitializeOutpostShip reads GameMode+0x998 (m_player).
-              //   If m_player == null â†’ function returns immediately, no-op.
+              //   If m_player == null Ã¢â€ â€™ function returns immediately, no-op.
               //   It then binds PlayerFlagshipChanged delegate on
               //   (m_player+0x958)+0x70 and InitializeOutpostShipInternal on
               //   (m_player+0x958)+0x90. Without these delegates, the ship
               //   never loads.
               //
               // Root cause of blank viewport: the game calls
-              // InitializeOutpostShip BEFORE our hook wires m_player â†’ it's
+              // InitializeOutpostShip BEFORE our hook wires m_player Ã¢â€ â€™ it's
               // always a no-op offline.
               //
               // Fix: After wiring m_player, check if cameras were populated
@@ -7619,8 +7604,8 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
 
                 if (cameraCount == 0 && !g_hudInitComplete) {
                   UObject *gm_obj = (UObject *)gm;
-                  // ── STEP 1: Wire tm+0x30 = GameMode (fixes crash inside
-                  // FUN_1403bd800) ──
+                  // â”€â”€ STEP 1: Wire tm+0x30 = GameMode (fixes crash inside
+                  // FUN_1403bd800) â”€â”€
                   void *tm = *(void **)(gm + 0x9A8);
                   if (tm) {
                     int32_t gmIndex = gm_obj->InternalIndex;
@@ -7633,7 +7618,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                           "[HUD] Wired tm+0x30 FWeakObjectPtr -> GameMode\n");
                     }
                   }
-                  printf("[HUD] Cameras not populated â€” calling "
+                  printf("[HUD] Cameras not populated Ã¢â‚¬â€ calling "
                          "OnHudAvailable + InitializeOutpostShipInternal.\n");
                   UFunction *onHudFn = (UFunction *)GetObjByName(
                       "Function DreadGame.YGameMode_Outpost.OnHudAvailable");
@@ -7642,14 +7627,14 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                     printf("[HUD] OnHudAvailable completed.\n");
                   }
 
-                  // â”€â”€ STEP 2: Call InitializeOutpostShipInternal natively
-                  // â”€â”€ (Moved to a 30-frame delay block to prevent BG
+                  // Ã¢â€â‚¬Ã¢â€â‚¬ STEP 2: Call InitializeOutpostShipInternal natively
+                  // Ã¢â€â‚¬Ã¢â€â‚¬ (Moved to a 30-frame delay block to prevent BG
                   // thread crash)
 
                   g_hudInitComplete = true;
 
                 } else {
-                  printf("[HUD] Cameras already populated (%d) â€” BP init ran "
+                  printf("[HUD] Cameras already populated (%d) Ã¢â‚¬â€ BP init ran "
                          "correctly.\n",
                          cameraCount);
                 }
@@ -7661,7 +7646,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
           printf("[UI] PC found but managers not ready yet (will retry)\n");
         }
       } catch (...) {
-        printf("[UI] Exception getting PlayerController â€” will retry on next "
+        printf("[UI] Exception getting PlayerController Ã¢â‚¬â€ will retry on next "
                "event\n");
       }
     }
@@ -7678,7 +7663,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
 
     // STATE MACHINE FIX: HandleHangarStateUpdate completed fleet injection +
     // HUD wiring, but menuState may still be stuck at STATE_TITLE because the
-    // RequestSession → timed delay flow never triggered. The delayed
+    // RequestSession â†’ timed delay flow never triggered. The delayed
     // InitializeOutpostShipInternal call (below) requires menuState >=
     // STATE_LOADING_HANGAR. Advance it now AND trigger the loading completion
     // sequence that the normal RequestSession path would have run.
@@ -7693,7 +7678,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
 
       // Run the loading completion that STATE_LOADING_DELAY would have done:
       if (g_capturedHUD) {
-        // 1. HandleLogin — tells the HUD the player is "logged in"
+        // 1. HandleLogin â€” tells the HUD the player is "logged in"
         UFunction *handleLoginFn = (UFunction *)GetObjByName(
             "Function DreadGameUI.FrontendHUD.HandleLogin");
         if (handleLoginFn) {
@@ -7701,7 +7686,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
           printf("[STATE] Called HandleLogin on HUD\n");
         }
 
-        // 2. HangarLoadFinished — signals hangar level is ready
+        // 2. HangarLoadFinished â€” signals hangar level is ready
         UFunction *hangarFinFn = (UFunction *)GetObjByName(
             "Function DreadGameUI.FrontendHUD.HangarLoadFinished");
         if (hangarFinFn) {
@@ -7712,7 +7697,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
         // 3. Trigger title screen removal + Home navigation on next
         // ProcessEvent
         g_streamingCallbackCountdown = 1;
-        printf("[STATE] Set streaming callback countdown — will navigate to "
+        printf("[STATE] Set streaming callback countdown â€” will navigate to "
                "Home next frame\n");
       }
     }
@@ -7922,7 +7907,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
           }
 
           s_ayMenuWiredGlobal = true;
-          printf("[HUD] Retry: Data wiring complete â€” letting BP handle "
+          printf("[HUD] Retry: Data wiring complete Ã¢â‚¬â€ letting BP handle "
                  "initialization\n");
         }
       }
@@ -7931,7 +7916,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
   }
 
   // === BLOCK only the functions that actually contact dead servers or loop
-  // back === IMPORTANT: DO NOT block RequestSession â€” its Blueprint handles
+  // back === IMPORTANT: DO NOT block RequestSession Ã¢â‚¬â€ its Blueprint handles
   // UI transitions. Only block the underlying native calls and failure
   // handlers.
   bool skipOriginal = false;
@@ -7992,7 +7977,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
     }
   }
 
-  // Deferred loading sequence â€” waits for engine to settle before triggering
+  // Deferred loading sequence Ã¢â‚¬â€ waits for engine to settle before triggering
   // login
   static bool g_phase1Done = false;
   if (menuState == STATE_LOADING_DELAY && g_loadingStartTimeMs > 0) {
@@ -8066,7 +8051,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
         // FUN_14039d200 = ScheduleTouchSession: constructs
         // TouchSessionRequestDefinition, sets up FTimerManager timer delegate,
         // and fires on TaskGraphThread after ~55-60s. The callback accesses
-        // freed objects â†’ EXCEPTION_ACCESS_VIOLATION. Patching with RET
+        // freed objects Ã¢â€ â€™ EXCEPTION_ACCESS_VIOLATION. Patching with RET
         // (0xC3) prevents the timer from ever being scheduled.
         {
           static const uint32_t timerFuncRVAs[] = {
@@ -8168,7 +8153,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
     printf("[LOAD] Hangar UI Initialized. Ready.\n");
   }
 
-  // === 5. IsHangarReady â€” it's a PROPERTY at 0x5D8 on UI_FrontEnd_C, not a
+  // === 5. IsHangarReady Ã¢â‚¬â€ it's a PROPERTY at 0x5D8 on UI_FrontEnd_C, not a
   // function === We set it directly in HandleHangarStateUpdate above. No
   // ProcessEvent intercept needed. Also keep it true continuously in case
   // Blueprint resets it:
@@ -8235,308 +8220,12 @@ bool menuEnabled = true;
 */
 HRESULT __stdcall hkPresent(IDXGISwapChain *pSwapChain, UINT SyncInterval,
                             UINT Flags) {
-  if (!init) {
-    if (SUCCEEDED(
-            pSwapChain->GetDevice(__uuidof(ID3D11Device), (void **)&pDevice))) {
-      pDevice->GetImmediateContext(&pContext);
-      DXGI_SWAP_CHAIN_DESC sd;
-      pSwapChain->GetDesc(&sd);
-      window = sd.OutputWindow;
-      ID3D11Texture2D *pBackBuffer;
-      pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
-                            (LPVOID *)&pBackBuffer);
-      pDevice->CreateRenderTargetView(pBackBuffer, NULL, &mainRenderTargetView);
-      pBackBuffer->Release();
-      oWndProc =
-          (WNDPROC)SetWindowLongPtr(window, GWLP_WNDPROC, (LONG_PTR)WndProc);
-      InitImGui();
-      init = true;
-    }
-
-    else
-      return oPresent(pSwapChain, SyncInterval, Flags);
-  }
-
+  // The ImGui overlay this hook used to render has been removed - the mod now
+  // drives the game's own menus. Present is still hooked because Steam's
+  // callback pump runs here; dropping the hook would stop SteamAPI callbacks.
   if (Dyn_SteamAPI_RunCallbacks)
     Dyn_SteamAPI_RunCallbacks();
 
-  ImGui_ImplDX11_NewFrame();
-  ImGui_ImplWin32_NewFrame();
-
-  ImGui::GetIO().MouseDrawCursor = menuEnabled;
-
-  ImGui::NewFrame();
-
-  /*
-          Main menu code begins here
-  */
-  if (menuEnabled) {
-    ImGui::Begin("Dreadnought (F7 to show/hide)", &menuEnabled,
-                 ImGuiWindowFlags_AlwaysAutoResize);
-
-    if (ImGui::BeginTabBar("MenuSelect")) {
-      if (ImGui::BeginTabItem("Singleplayer")) {
-        const char *difficultyNames[3] = {"Recruit", "Veteran", "Legendary"};
-
-        const char *mapNames[10] = {
-            "Amirani",   "DansMap",  "Derelict",  "Glacier", "Gorge",
-            "Highlands", "Paradise", "Skybridge", "Space01", "Space02"};
-
-        ImGui::SliderInt("Num Friendly Bots", &numBotsTeamOne, 0, 7);
-        ImGui::SliderInt("Num Enemy Bots", &numBotsTeamTwo, 0, 8);
-        ImGui::Combo("Bot Difficulty", &difficulty, difficultyNames, 3);
-        ImGui::Combo("Map", &map, mapNames, 10);
-
-        const char *singleplayerLoadoutNames[] = {
-            "Corvette", "Artillery Cruiser", "Dreadnought Heavy", "Destroyer",
-            "Tactical Cruiser"};
-        const char *singleplayerLoadoutPaths[] = {
-            "/Game/Generic/Loadouts/Precast/T5/"
-            "VH_AssaultLight_PrecastLoadout_T5_BP",
-            "/Game/Generic/Loadouts/Precast/T5/"
-            "VH_SniperLight_T5_PrecastLoadout_BP",
-            "/Game/Generic/Loadouts/Precast/T5/"
-            "VH_DreadnoughtHeavy_PrecastLoadout_T5_BP",
-            "/Game/Generic/Loadouts/Precast/T5/"
-            "VH_DestroyerMedium_PrecastLoadout_T5_BP",
-            "/Game/Generic/Loadouts/Precast/T5/"
-            "VH_TacticalCruiser_PrecastLoadout_T5_BP"};
-
-        if (ImGui::Combo("Ship Loadout", &singleplayerLoadoutIndex,
-                         singleplayerLoadoutNames, 5)) {
-          singleplayerLoadoutString =
-              singleplayerLoadoutPaths[singleplayerLoadoutIndex];
-        }
-
-        if (ImGui::Button("Launch Singleplayer")) {
-          launchSingleplayer = true;
-        }
-
-        ImGui::EndTabItem();
-      }
-      if (ImGui::BeginTabItem("Tutorial")) {
-        if (ImGui::Button("Launch Tutorial"))
-          launchTutorial = true;
-        ImGui::EndTabItem();
-      }
-      if (ImGui::BeginTabItem("Multiplayer (BETA)")) {
-        ImGui::InputText("Server IP", &serverIP);
-        ImGui::SameLine();
-
-        if (ImGui::Button("Connect"))
-          connectToServer = true;
-        ImGui::EndTabItem();
-      }
-
-      if (ImGui::BeginTabItem("Host Server")) {
-        const char *difficultyNames[3] = {"Recruit", "Veteran", "Legendary"};
-        const char *mapNames[10] = {
-            "Amirani",   "DansMap",  "Derelict",  "Glacier", "Gorge",
-            "Highlands", "Paradise", "Skybridge", "Space01", "Space02"};
-        const char *singleplayerLoadoutNames[] = {
-            "Corvette", "Artillery Cruiser", "Dreadnought Heavy", "Destroyer",
-            "Tactical Cruiser"};
-
-        ImGui::Combo("Map", &hostMapIndex, mapNames, 10);
-        ImGui::Combo("Host Ship", &hostLoadoutIndex, singleplayerLoadoutNames,
-                     5);
-        ImGui::Combo("Bot Difficulty", &hostDifficulty, difficultyNames, 3);
-
-        ImGui::Separator();
-
-        ImGui::InputText("Server Name", hostServerName,
-                         IM_ARRAYSIZE(hostServerName));
-        ImGui::InputText("Password", hostPassword, IM_ARRAYSIZE(hostPassword),
-                         ImGuiInputTextFlags_Password);
-
-        ImGui::Separator();
-
-        if (Dyn_SteamAPI_IsSteamRunning && Dyn_SteamAPI_IsSteamRunning()) {
-          ImGui::TextColored(ImVec4(0, 1, 0, 1), "Steam Status: Online");
-        } else {
-          ImGui::TextColored(ImVec4(1, 0, 0, 1), "Steam Status: Offline");
-        }
-
-        if (ImGui::Button("Start Hosting")) {
-          if (Dyn_SteamMatchmaking) {
-            SteamAPICall_t call =
-                Dyn_SteamMatchmaking()->CreateLobby(k_ELobbyTypePublic, 16);
-            g_LobbyManager.m_LobbyCreatedCallResult.Set(
-                call, &g_LobbyManager, &SteamLobbyManager::OnLobbyCreated);
-          }
-          launchHostServer = true;
-        }
-
-        ImGui::EndTabItem();
-      }
-      /*
-      if (ImGui::BeginTabItem("Debug")) {
-              if (ImGui::Button("Buffs Manager")) {
-                      AYPlayerController* pc =
-      (AYPlayerController*)(*UWorld::GWorld)->OwningGameInstance->LocalPlayers[0]->PlayerController;
-
-                      std::cout << ((AYPawn*)pc->Pawn)->m_buffsComponent <<
-      std::endl;
-              }
-              if (ImGui::Button("Force Loadout")) {
-                      AYPlayerController* pc =
-      (AYPlayerController*)(*UWorld::GWorld)->OwningGameInstance->LocalPlayers[0]->PlayerController;
-
-                      StaticLoadClass(UYShipLoadout::StaticClass(), nullptr,
-      L"/Game/Generic/Loadouts/Precast/T5/VH_SniperLight_T5_PrecastLoadout_BP");
-
-                      UYShipLoadout* loadoutToApply = nullptr;
-
-                      for (UYShipLoadout* cmpLoadout : UObject::FindObjects<
-      UYShipLoadout>()) { if (cmpLoadout->GetFullName().find("Sniper") !=
-      std::string::npos) { loadoutToApply = cmpLoadout;
-                              }
-                      }
-
-                      ((AYPlayerController*)pc)->AddAndActiveLoadoutFromBlueprint(loadoutToApply->Class);
-              }
-
-              if (ImGui::Button("Enable AI Spawn")) {
-                      ((AYGameMode_Multiplayer*)(*UWorld::GWorld)->AuthorityGameMode)->m_enableSpawnAI
-      = true;
-              }
-
-              if (ImGui::Button("Disable AI Spawn")) {
-                      ((AYGameMode_Multiplayer*)(*UWorld::GWorld)->AuthorityGameMode)->m_enableSpawnAI
-      = false;
-              }
-
-              if (ImGui::Button("Load Loadout")) {
-                      StaticLoadClass(UYShipLoadout::StaticClass(), nullptr,
-      L"/Game/Generic/Loadouts/Precast/T5/VH_AssaultLight_PrecastLoadout_T5_BP");
-              }
-
-              if (ImGui::Button("InstaStartMatch")) {
-                      ((AYGameState*)(*UWorld::GWorld)->AuthorityGameMode->GameState)->SetRemainingTime(1);
-              }
-
-              if (ImGui::Button("Listen")) {
-                      Listen();
-              }
-
-              if (ImGui::Button("RestartAllPlayers")) {
-                      StaticLoadClass(UYShipLoadout::StaticClass(), nullptr,
-      L"/Game/Generic/Loadouts/Precast/T5/VH_AssaultLight_PrecastLoadout_T5_BP");
-
-                      for (AYPlayerController* pc :
-      UObject::FindObjects<AYPlayerController>()) { if
-      (pc->GetFullName().find("Default") == std::string::npos) { // && pc !=
-      (*UWorld::GWorld)->OwningGameInstance->LocalPlayers[0]->PlayerController
-                                      if
-      (!pc->GetLoadoutManager()->m_activeLoadout) { UYShipLoadout*
-      loadoutToApply = nullptr;
-
-                                              for (UYShipLoadout* cmpLoadout :
-      UObject::FindObjects< UYShipLoadout>()) { if
-      (cmpLoadout->GetFullName().find("VH_AssaultLight_PrecastLoadout_T5_BP") !=
-      std::string::npos) { loadoutToApply = cmpLoadout;
-                                                      }
-                                              }
-
-                                              pc->GetLoadoutManager()->m_activeLoadout
-      = loadoutToApply;
-                                              pc->AddAndActiveLoadoutFromBlueprint(loadoutToApply->Class);
-                                      }
-                                      pc->ServerRestartPlayer();
-                              }
-                      }
-              }
-
-              if (ImGui::Button("AI Team")) {
-                      StaticLoadClass(UYNPCPawnData::StaticClass(), nullptr,
-      L"/Game/Generic/GameModes/TDM/AIShips_TDM_Vet");
-
-                      Sleep(1 * 1000);
-
-                      ListAllObjectsOfType< UYNPCPawnData>();
-
-                      ((AYPlayerController*)(*UWorld::GWorld)->OwningGameInstance->LocalPlayers[0]->PlayerController)->GetCombatManager()->m_NPCSet
-      = getLastOfType< UYNPCPawnData>();
-                      ((AYPlayerController*)(*UWorld::GWorld)->OwningGameInstance->LocalPlayers[0]->PlayerController)->GetCombatManager()->m_isNPCSetLoaded
-      = true;
-
-                      UYNPCPawnData* pawnData = getLastOfType< UYNPCPawnData>();
-
-                      for (int i = 0; i <
-      ((AYGameMode_Multiplayer*)(*UWorld::GWorld)->AuthorityGameMode)->m_npcPlayers.Count();
-      i++) { TArray<FName> shipIDs;
-
-                              shipIDs._data = (FName*)UE4Malloc(sizeof(FName) *
-      pawnData->m_PawnsData.Count()); shipIDs._count =
-      pawnData->m_PawnsData.Count(); shipIDs._max =
-      pawnData->m_PawnsData.Count();
-
-                              for (int j = 0; j < pawnData->m_PawnsData.Count();
-      j++) { shipIDs[j] = pawnData->m_PawnsData[j].m_shipId;
-                              }
-
-                              ((AYGameMode_Multiplayer*)(*UWorld::GWorld)->AuthorityGameMode)->m_npcPlayers[i].m_npcSpawnIDs
-      = shipIDs;
-                      }
-
-                      for (int i = 0; i <
-      ((AYGameMode_Multiplayer*)(*UWorld::GWorld)->AuthorityGameMode)->m_aiSpawnTierRules.Count();
-      i++) {
-                              ((AYGameMode_Multiplayer*)(*UWorld::GWorld)->AuthorityGameMode)->m_aiSpawnTierRules[i].m_aiTier_aiDificultyLevel
-      = EYAILevel::YAIL_LEGENDARY;
-                      }
-
-                      ((AYGameMode_Multiplayer*)(*UWorld::GWorld)->AuthorityGameMode)->SetTeamSizeAI(EYTeam::YT_TEAM1,
-      6);
-                      ((AYGameMode_Multiplayer*)(*UWorld::GWorld)->AuthorityGameMode)->SetTeamSizeAI(EYTeam::YT_TEAM2,
-      6);
-              }
-              ImGui::EndTabItem();
-              }
-      */
-      if (ImGui::BeginTabItem("Fleet & Inventory")) {
-        ImGui::Text("Backend: %s", g_ActivePersistenceBackend == PersistenceBackendType::JSON ? "JSON (profile.json)" : "SQLite");
-        ImGui::Text("Credits: %d | XP: %d | Owned Ships: %d", g_credits, g_xp, (int)g_ownedShips.size());
-        ImGui::Separator();
-        
-        if (ImGui::Button("+10,000 Credits")) {
-          g_credits += 10000;
-          SaveFleetData();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("+5,000 Free XP")) {
-          g_xp += 5000;
-          SaveFleetData();
-        }
-
-        if (ImGui::Button("Unlock All Ships")) {
-          for (int i = 1; i <= 50; i++) {
-            g_ownedShips.insert(i);
-          }
-          SaveFleetData();
-        }
-        
-        ImGui::Separator();
-        ImGui::Text("Active Fleet Slots:");
-        for (size_t i = 0; i < g_fleetSlots.size(); i++) {
-          ImGui::Text("Slot %d: Ship ID %d", (int)i, g_fleetSlots[i]);
-        }
-
-        ImGui::EndTabItem();
-      }
-      ImGui::EndTabBar();
-    }
-
-    ImGui::End();
-  }
-  /*
-          Main menu code ends here
-  */
-
-  ImGui::Render();
-
-  pContext->OMSetRenderTargets(1, &mainRenderTargetView, NULL);
-  ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
   return oPresent(pSwapChain, SyncInterval, Flags);
 }
 
@@ -8556,6 +8245,18 @@ ResizeBuffers oResizeBuffers;
 HRESULT hkResizeBuffers(IDXGISwapChain *pThis, UINT BufferCount, UINT Width,
                         UINT Height, DXGI_FORMAT NewFormat,
                         UINT SwapChainFlags) {
+  // Pure passthrough now. This hook existed to release and rebuild the render
+  // target view the ImGui overlay drew into - a stale view across a resolution
+  // change was what crashed the game. With no overlay there is no view to
+  // manage, so there is nothing to do but forward the call.
+  return oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat,
+                        SwapChainFlags);
+}
+
+#if 0 // Original overlay-aware implementation, kept for reference.
+HRESULT hkResizeBuffers_Overlay(IDXGISwapChain *pThis, UINT BufferCount,
+                                UINT Width, UINT Height, DXGI_FORMAT NewFormat,
+                                UINT SwapChainFlags) {
   if (mainRenderTargetView) {
     pContext->OMSetRenderTargets(0, 0, 0);
     mainRenderTargetView->Release();
@@ -8584,6 +8285,7 @@ HRESULT hkResizeBuffers(IDXGISwapChain *pThis, UINT BufferCount, UINT Width,
   pContext->RSSetViewports(1, &vp);
   return hr;
 }
+#endif // Original overlay-aware hkResizeBuffers
 
 /*
         This stub function prevents the hud from being created on the listen
@@ -10307,7 +10009,7 @@ void GatewayServerThread() {
 // --- Initialize the GetCommandLineW hook (must be called EARLY) ---
 void InitGatewayHook() {
   // Initialize MinHook if not already done
-  MH_Initialize(); // Safe to call multiple times â€” returns
+  MH_Initialize(); // Safe to call multiple times Ã¢â‚¬â€ returns
                    // MH_ERROR_ALREADY_INITIALIZED which is fine
 
   // Hook GetCommandLineW from kernel32.dll
@@ -10347,7 +10049,7 @@ void InitGatewayHook() {
 // (GetAuthTokenHook writes fake "0w0" token, ValidateFirmamentCertHook returns
 // 1)
 
-// Vectored Exception Handler â€” safety net for background thread crashes.
+// Vectored Exception Handler Ã¢â‚¬â€ safety net for background thread crashes.
 // Logs crash details to a persistent file AND terminates only the crashing
 // thread via ExitThread(0). This is acceptable because:
 //   - TaskGraph has multiple worker threads; losing one is survivable
@@ -10411,7 +10113,7 @@ static LONG WINAPI BackgroundThreadVEH(PEXCEPTION_POINTERS pExInfo) {
   // Safety valve: a thread accumulates 50+ total AVs (runaway async task).
   //
   // Deliberately removed: the old "8 AVs per thread" sequential-scan killer.
-  // That threshold was too low â€” a second ship selection in the tech tree
+  // That threshold was too low Ã¢â‚¬â€ a second ship selection in the tech tree
   // legitimately triggers 7 distinct-RVA AVs in a null-module-display walk
   // that is a one-shot pass, NOT an infinite loop. Killing the thread there
   // broke the module list for all subsequent ship selections.
@@ -10503,7 +10205,7 @@ static LONG WINAPI BackgroundThreadVEH(PEXCEPTION_POINTERS pExInfo) {
   LeaveCriticalSection(&s_cs);
 
   if (forceReturn) {
-    // Cannot safely "force return" â€” we don't know the function's frame
+    // Cannot safely "force return" Ã¢â‚¬â€ we don't know the function's frame
     // layout (how many registers were pushed before the AV). Guessing RSP leads
     // to jumping to garbage addresses (seen: 0xFFFF8009501D0000 -> runaway AV
     // storm).
@@ -10525,7 +10227,7 @@ static LONG WINAPI BackgroundThreadVEH(PEXCEPTION_POINTERS pExInfo) {
     // The reported "RVA" is meaningless when RIP is outside the game module
     // (0x3D4CC9B2C is ~16GB past the base). Identify the module RIP actually
     // sits in, and note that the faulting data address is identical on every
-    // occurrence â€” a fixed pointer, not random corruption.
+    // occurrence Ã¢â‚¬â€ a fixed pointer, not random corruption.
     char ripModule[MAX_PATH] = "<unknown>";
     uintptr_t ripOffset = 0;
     HMODULE ripMod = nullptr;
@@ -10571,7 +10273,7 @@ static LONG WINAPI BackgroundThreadVEH(PEXCEPTION_POINTERS pExInfo) {
   }
 
   // -----------------------------------------------------------------------
-  // RVA 0x2322C0: MOV EBX,[RCX+8] â€” crash in ProcessMulticastDelegate.
+  // RVA 0x2322C0: MOV EBX,[RCX+8] Ã¢â‚¬â€ crash in ProcessMulticastDelegate.
   // From disasm_2322A0.txt, the prologue is:
   //   0x2322A0: MOV R11,RSP
   //   0x2322A3: PUSH RBX       (RSP -= 8)
@@ -10662,7 +10364,7 @@ static LONG WINAPI BackgroundThreadVEH(PEXCEPTION_POINTERS pExInfo) {
     // Optional legacy prefixes (F2=REPNE, F3=REP, 66=operand size override)
     while (ip[i] == 0xF2 || ip[i] == 0xF3 || ip[i] == 0x66)
       i++;
-    // Single REX prefix (0x40-0x4F) â€” x86-64 only allows ONE
+    // Single REX prefix (0x40-0x4F) Ã¢â‚¬â€ x86-64 only allows ONE
     if ((ip[i] & 0xF0) == 0x40)
       i++;
 
@@ -10762,7 +10464,7 @@ static void* oGetOwnedShipDataStructs = nullptr;
 static void* oGetOwnedShipLoadouts = nullptr;
 static void* oViewShipDetailsClicked = nullptr;
 
-// GetOwnedShipDataStructs â€” UFunction exec thunk.
+// GetOwnedShipDataStructs Ã¢â‚¬â€ UFunction exec thunk.
 //
 // RVA 0xBB9530 is NOT the C++ implementation. Ghidra decompile of
 // FUN_140b057d0 shows the native registrar doing:
@@ -10947,7 +10649,7 @@ void __fastcall hkGetOwnedShipDataStructs(UObject* Context, void* Stack, void* R
 }
 
 
-// GetOwnedShipLoadouts â€” exec thunk, same correction as above. Registrar
+// GetOwnedShipLoadouts Ã¢â‚¬â€ exec thunk, same correction as above. Registrar
 // FUN_140b057d0 maps "GetOwnedShipLoadouts" to thunk FUN_140bb95e0, whose real
 // body is 0xACBA70.
 void __fastcall hkGetOwnedShipLoadouts(UObject* Context, void* Stack, void* RESULT_DECL) {
@@ -11889,8 +11591,8 @@ void __fastcall MyHookAddShipToFleet(UObject *Context, void *Stack,
 }
 
 // ViewShipDetailsClicked was hooked at RVA 0xBB8AE0 as a plain member function
-// (pThis, ShipId). If that address is also an exec thunk â€” and every other
-// DreadGameUI entry point checked so far is â€” then RDX is FFrame*, not an int,
+// (pThis, ShipId). If that address is also an exec thunk Ã¢â‚¬â€ and every other
+// DreadGameUI entry point checked so far is Ã¢â‚¬â€ then RDX is FFrame*, not an int,
 // so ShipId was garbage, and skipping the thunk meant FFrame::Code was never
 // advanced past EX_EndFunctionParms, corrupting the bytecode stream. Left
 // disabled until its RVA is verified the same way 0xBB9530 was.
@@ -11914,9 +11616,9 @@ void InitEarlyHooks() {
   // Now installed by name through InstallNativeHook, the same mechanism the
   // other ~15 UFunction hooks in this file use, with the correct
   // (Context, Stack, RESULT_DECL) signature. Deferred to InitUIHooks timing is
-  // not required â€” these resolve at early-hook time if the class is loaded, so
+  // not required Ã¢â‚¬â€ these resolve at early-hook time if the class is loaded, so
   // failure just logs a warning.
-  // Tech tree entry lookup â€” makes the TTM answer to both synthetic and real
+  // Tech tree entry lookup Ã¢â‚¬â€ makes the TTM answer to both synthetic and real
   // cache IDs. See MyHookFindTechTreeEntry.
   {
     void *findAddr = (void *)(Globals::ModuleBase + 0x003F51A0);
@@ -12038,7 +11740,7 @@ void InitEarlyHooks() {
   }
 
   // Mmogbrain entitlement scans. These are what make the engine's own
-  // prerequisite evaluation work offline â€” see MyHookHasResearchedScan.
+  // prerequisite evaluation work offline Ã¢â‚¬â€ see MyHookHasResearchedScan.
   {
     void *researchedAddr = (void *)(Globals::ModuleBase + 0x00547DD0);
     if (MH_CreateHook(researchedAddr, &MyHookHasResearchedScan,
@@ -12060,7 +11762,7 @@ void InitEarlyHooks() {
   }
 
   // EYTechTreeItemState resolver (RVA 0x53C870). Real function body, verified
-  // by decompile â€” it is called directly by FUN_1404f6b50, not registered as a
+  // by decompile Ã¢â‚¬â€ it is called directly by FUN_1404f6b50, not registered as a
   // native UFunction, so MinHook with register params is correct here.
   {
     void *stateAddr = (void *)(Globals::ModuleBase + 0x0053C870);
@@ -12075,7 +11777,7 @@ void InitEarlyHooks() {
 
   // NOTE: the owned-ships and HasItem name-based hooks are installed in
   // InitUIHooks, not here. At early-hook time the DreadGameUI classes are not
-  // loaded yet, so GetObjByName fails and the install silently no-ops â€” the
+  // loaded yet, so GetObjByName fails and the install silently no-ops Ã¢â‚¬â€ the
   // first run of this code logged "Could not find UFunction" for all three.
 
   // ViewShipDetailsClicked (RVA 0x00BB8AE0): DISABLED pending verification.
@@ -12096,7 +11798,7 @@ void InitEarlyHooks() {
   // The WebServicesPlugin has ~10 scheduler functions (touch session, ping,
   // market bundles, legal docs, mmog connection, etc.) that each call SetTimer
   // (FUN_141c8f760). When any timer fires on TaskGraphThread, it accesses dead
-  // web service objects â†’ crash. Patching all of them with RET (0xC3)
+  // web service objects Ã¢â€ â€™ crash. Patching all of them with RET (0xC3)
   // prevents ANY timer from being scheduled.
   {
     uintptr_t base =
@@ -12119,8 +11821,8 @@ void InitEarlyHooks() {
           0x3AA880, // Scheduler #11 (SetTimer at 0x3AA894)
           // Also the timer delegate target from ScheduleTouchSession:
           0x38ED50, // Timer delegate target (puVar8[2] in scheduler)
-          // Nuclear option â€” patch UE4 SetTimer itself
-          0x1C8F760, // UE4 FTimerManager::SetTimer â€” prevent ALL timer
+          // Nuclear option Ã¢â‚¬â€ patch UE4 SetTimer itself
+          0x1C8F760, // UE4 FTimerManager::SetTimer Ã¢â‚¬â€ prevent ALL timer
                      // scheduling
       };
       const int NUM_TIMERS = sizeof(timerRVAs) / sizeof(timerRVAs[0]);
@@ -12213,15 +11915,15 @@ void InitEarlyHooks() {
   // the answer to *RESULT_DECL.
   //
   // Under the old signature the detour returned its bool in RAX, which the
-  // caller never reads, and never wrote RESULT_DECL â€” so HasItem actually
+  // caller never reads, and never wrote RESULT_DECL Ã¢â‚¬â€ so HasItem actually
   // returned whatever happened to be in that stack slot, not true. It also
   // skipped P_FINISH, leaving the bytecode pointer un-advanced. The logged
   // "itemID" was really the FFrame pointer.
   //
-  // Now hooked by name with the correct signature, from InitUIHooks â€” the
+  // Now hooked by name with the correct signature, from InitUIHooks Ã¢â‚¬â€ the
   // DreadGame classes are not resolvable this early.
 
-  // Hook FUN_140480f70 (FindCachedDataEntry) â€” the bottleneck that prevents
+  // Hook FUN_140480f70 (FindCachedDataEntry) Ã¢â‚¬â€ the bottleneck that prevents
   // item processing Both item loops in FUN_1404f3190 are inside `if (local_240
   // != NULL)`, and local_240 comes from this.
   {
@@ -12240,7 +11942,7 @@ void InitEarlyHooks() {
     }
   }
 
-  // Hook FUN_1404e0520 (ItemFilter) â€” the per-item validation/widget-builder
+  // Hook FUN_1404e0520 (ItemFilter) Ã¢â‚¬â€ the per-item validation/widget-builder
   {
     void *itemFilterAddr = (void *)(Globals::ModuleBase + 0x4E0520);
     MH_STATUS status = MH_CreateHook(
@@ -12294,7 +11996,7 @@ void InitEarlyHooks() {
 
   printf("[BRIDGE] Phase 3 translation hooks installed.\n");
 
-  // Hangar 3D model streaming hook â€” UYItemIDList::LoadItemsAsync (RVA
+  // Hangar 3D model streaming hook Ã¢â‚¬â€ UYItemIDList::LoadItemsAsync (RVA
   // 0x2D9390) Prevents "Given object is empty!" from aborting the hangar
   // preview pipeline. The function checks [this+8] (item count) before
   // streaming; we inject the active loadout object if the list is empty so
