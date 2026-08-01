@@ -1352,8 +1352,19 @@ void InstallNativeHook(const char *funcName, void *hookFunc,
   }
   if (origFuncOut)
     *origFuncOut = fn->Func;
+
+  // Capture the thunk RVA *before* overwriting Func. Names resolve to exec
+  // thunks, never to the real C++ body, so this is the starting point for
+  // `decompile_at <rva>` when a hook needs the body instead - the only way to
+  // read a UFunction's parameters without parsing the FFrame by hand.
+  uintptr_t thunkRva = (uintptr_t)fn->Func - (uintptr_t)Globals::ModuleBase;
+
+  // The actual install. Do not remove: without this line every by-name hook
+  // silently becomes a no-op while still logging "installed".
   fn->Func = hookFunc;
-  printf("[HOOK] Native hook installed: %s\n", funcName);
+
+  printf("[HOOK] Native hook installed: %s (thunk RVA 0x%llX)\n", funcName,
+         (unsigned long long)thunkRva);
 }
 
 static UObject *g_capturedHUD =
@@ -1659,6 +1670,13 @@ struct LoadedShipInfo {
   EYShipClass shipClass; // Ship class enum
   int32_t tier;          // Ship tier (1-5)
   int32_t shipId;        // Unique UI ship ID
+  // FYLoadoutEntry+0x20. This is the int32 the engine itself matches on in
+  // UYLoadoutManagerComponent::GetLoadoutForShipID (RVA 0x340950), which walks
+  // m_loadoutEntries and compares *(int*)(entry + 0x20) against the shipID the
+  // UI passed. AddShipToFleet fails with "Loadout is NULL" whenever no entry
+  // carries the requested ID, so this is the only ID space the fleet code
+  // accepts - unrelated to shipId above, which is just a 1..N counter.
+  int32_t loadoutEntryKey;
 };
 static LoadedShipInfo g_loadedShips[MAX_LOADED_SHIPS] = {};
 static int g_numLoadedShips = 0;
@@ -1704,13 +1722,26 @@ static bool bHasHookedIsCurrentShipOwnedByPlayer = false;
 typedef bool(__fastcall *tHasItemNative)(void *pThis, int32_t itemID);
 static tHasItemNative OrigHasItemNative = nullptr;
 
-bool __fastcall MyHookHasItemNative(void *pThis, int32_t itemID) {
-  static int logCount = 0;
-  if (logCount < 50) {
-    tee_printf("[HASITEM-NATIVE] Intercepted native HasItem(%d) -> returning true\n", itemID);
-    logCount++;
+// Exec thunk signature â€” see the install site in InitUIHooks for why.
+static void *OrigHasItemNativeFunc = nullptr;
+
+void __fastcall MyHookHasItemNative(UObject *Context, void *Stack,
+                                    void *RESULT_DECL) {
+  // Run the original first: it parses itemID out of the FFrame, performs the
+  // P_FINISH bytecode advance, and writes a real answer into RESULT_DECL.
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigHasItemNativeFunc)
+    ((OrigFunc)OrigHasItemNativeFunc)(Context, Stack, RESULT_DECL);
+
+  if (RESULT_DECL) {
+    static int logCount = 0;
+    if (logCount < 20) {
+      tee_printf("[HASITEM-NATIVE] HasItem -> forcing true (was %d)\n",
+                 (int)*(uint8_t *)RESULT_DECL);
+      logCount++;
+    }
+    *(bool *)RESULT_DECL = true;
   }
-  return true;
 }
 
 static void *OriginalHasItemUFunctionFunc = nullptr;
@@ -1950,9 +1981,118 @@ static std::map<int32_t, int32_t> g_syntheticToRealMap;
 // real IDs (stored by Blueprint after our SSS swap) back to synthetic IDs
 // so the TTM mfg-array lookup finds our injected ship entries.
 static std::map<int32_t, int32_t> g_realToSyntheticMap;
+
+// Synthetic tech-tree ship ID (11001+) -> FYLoadoutEntry key.
+//
+// Distinct from g_realToSyntheticMap, which is derived from the tech tree
+// discovery cache and therefore only exists after the player has opened a tech
+// tree screen. This one is built from m_loadoutEntries during fleet injection,
+// so it is always available - which matters because the fleet screens can be
+// reached without ever visiting a tech tree. Keys are the real 0x01FF0xxx cache
+// IDs (e.g. Simargl = 33489423 = 0x01FF020F).
+static std::map<int32_t, int32_t> g_syntheticToLoadoutKey;
+
+// FleetManager instance, captured during fleet injection so the UI hooks can
+// resolve which fleet is currently being edited.
+static void *g_fleetManagerPtr = nullptr;
+
+// Tier ranges per fleet type, mirroring m_fleetEligibiliyConfigTable as it is
+// built. The picker uses this to stop offering ships the fleet would reject.
+struct FleetTierRange {
+  uint8_t fleetType;
+  int minTier;
+  int maxTier;
+};
+static FleetTierRange g_fleetTierRanges[8] = {};
+static int g_numFleetTierRanges = 0;
+
+// Audit tracer switch â€” see the [TRACE] block in ProcessEventHook.
+static bool g_auditTraceEnabled = true;
+
+// Is [p, p+size) committed and writable right now?
+//
+// Several hooks pull a struct pointer straight out of FFrame::Locals and write
+// through it, guarded by nothing but a null check. That is not enough: a
+// non-null pointer to a freed allocation passes the check and then faults on
+// write. Confirmed as the cause of the Owned Ships click crash â€” the fault was
+// a write at Dreadnought.dll+0x9B2C (mov [rax+8], ebp) through a stale
+// FYUIShipManufacturerTechItemData pointer, at the same address every run.
+// Is [p, p+size) committed and *readable*?
+//
+// Use this for anything that legitimately lives in read-only memory - vtables
+// above all. IsWritableMemory rejects those unconditionally because a vtable is
+// PAGE_READONLY, so guarding a vtable read with it silently fails 100% of the
+// time. That mistake made the fleet remove hook a no-op.
+static bool IsReadableMemory(const void *p, size_t size) {
+  if (!p)
+    return false;
+  MEMORY_BASIC_INFORMATION mbi = {};
+  if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
+    return false;
+  if (mbi.State != MEM_COMMIT)
+    return false;
+  if (mbi.Protect & PAGE_GUARD)
+    return false;
+  const DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                          PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                          PAGE_EXECUTE_WRITECOPY;
+  if ((mbi.Protect & kReadable) == 0)
+    return false;
+  uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+  return ((uintptr_t)p + size) <= regionEnd;
+}
+
+static bool IsWritableMemory(const void *p, size_t size) {
+  if (!p)
+    return false;
+  MEMORY_BASIC_INFORMATION mbi = {};
+  if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
+    return false;
+  if (mbi.State != MEM_COMMIT)
+    return false;
+  if (mbi.Protect & PAGE_GUARD)
+    return false;
+  const DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
+                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+  if ((mbi.Protect & kWritable) == 0)
+    return false;
+  uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+  return ((uintptr_t)p + size) <= regionEnd;
+}
+
+// Defined further down; needed by the purchase completion path.
+void ProcInMainThread(std::function<void()> Func);
+
+// Resolve any tech tree item ID to our synthetic ship ID, or -1.
+//
+// The UI speaks two dialects. The manufacturer tech tree list works in
+// synthetic IDs (11001+), but SetSelectedShip translates synthetic -> real
+// before handing the selection on, so the ship detail panel and the purchase
+// data path ask about real cache IDs (0x01FF012E and friends). Ownership is
+// tracked purely in synthetic IDs, so a range check alone silently ignores
+// every detail-panel query â€” which is why an owned ship could show as needing
+// research while an unowned one showed as owned.
+static int32_t ResolveToSyntheticShipId(int32_t itemID) {
+  if (itemID >= 11000 && itemID <= 19999)
+    return itemID;
+  auto it = g_realToSyntheticMap.find(itemID);
+  if (it != g_realToSyntheticMap.end())
+    return it->second;
+  return -1;
+}
 // Module/weapon IDs referenced by ships' m_relatedItemIDs
 // Maps: moduleItemId -> FYRelatedItemEntry.m_identifier (slot type byte)
 static std::map<int32_t, uint8_t> g_moduleItemIds;
+
+// Per-ship module/weapon lists, keyed by the ship's REAL cache ID
+// (0x01FF0xxx), each value a list of (moduleItemID, slot identifier).
+//
+// g_moduleItemIds above flattens every ship's modules into one global set,
+// which is enough to populate TTM+0x68 but throws away the ship association -
+// and the association is exactly what the per-ship tech tree needs. Built from
+// the same m_relatedItemIDs walk, in the same pass.
+static std::map<int32_t, std::vector<std::pair<int32_t, uint8_t>>>
+    g_shipRelatedItems;
 
 static void ScanCacheForTiers() {
   if (g_tierCacheScanned)
@@ -2045,8 +2185,16 @@ static void ScanCacheForTiers() {
           uint8_t *relEntry = (uint8_t *)relData + r * 8;
           uint8_t identifier = *(uint8_t *)(relEntry + 0x00);
           uint32_t relItemId = *(uint32_t *)(relEntry + 0x04);
-          if (relItemId != 0) {
+          // An unfilled slot is stored as -1, not 0 - the Agosta's four
+          // officer slots all read 0xFFFFFFFF. Those are not items and must
+          // not reach the tech tree, or the UI tries to resolve them.
+          if (relItemId != 0 && (int32_t)relItemId > 0) {
             g_moduleItemIds[(int32_t)relItemId] = identifier;
+            // Keyed by the real cache ID because that is the ID space the tech
+            // tree screens query in - the engine's own failure message reads
+            // "Modules not found for ship id 33489267" (= 0x01FF0233).
+            g_shipRelatedItems[itemId].push_back(
+                std::make_pair((int32_t)relItemId, identifier));
           }
         }
       }
@@ -2073,11 +2221,233 @@ static void ScanCacheForTiers() {
     }
   }
   printf("[DISCOVERY] Cache scan complete: %d ships, %d modules, %d other (%d "
-         "total). Tiers: %d/5. Related modules: %d unique.\n",
+         "total). Tiers: %d/5. Related modules: %d unique, %d ships with "
+         "module lists.\n",
          shipCount, moduleCount, otherCount, (int)g_discoveryCache.size(),
-         found, (int)g_moduleItemIds.size());
+         found, (int)g_moduleItemIds.size(), (int)g_shipRelatedItems.size());
 
   BuildSyntheticToRealMap();
+}
+
+// ===========================================================================
+// Per-ship tech trees: TTM+0x48
+// ===========================================================================
+//
+// UYTechTreeManager::FindShipTechTreeData (RVA 0x3F5050) is the single choke
+// point for every per-ship tech tree query in the game. It is a flat linear
+// scan of TTM+0x48 with count at TTM+0x50 and stride 0x28:
+//
+//   record +0x00  int64  shipItemID          (compared against the query ID)
+//          +0x08  TArray modules             <- what every consumer reads
+//          +0x18  TArray proxyItems          (ProxyType 0..9, unused offline)
+//
+// It has ten callers, and all of the ones that matter read the +0x08 array
+// with stride 0x48 and the item ID at +0x20:
+//
+//   0xAA9570  UTechTreeInterpreter -> m_modulesAvailableOnTechTree  (the "/N")
+//   0xAA7E40  owned + precast split           -> m_currentOwnedModules
+//   0xAA8110  wrapper over 0xAA7E40           (the "M/")
+//   0xA989A0  ComposeModuleUiDataForShip      (the module list the screen shows)
+//   0xAA88F0  research XP total
+//   0x4EE820  YUIExternalFunctions::GetShipResearchData
+//
+// TTM+0x48 was never populated - the mod fills TTM+0x38 (manufacturer groups),
+// TTM+0x58 (class lookups) and TTM+0x68 (orphaned items), but not this one.
+// So FindShipTechTreeData returned false for every ship, which is why the
+// counter read 0/0 and the log carried
+// "ComposeModuleUiDataForShip Modules not found for ship id 33489267".
+//
+// Normally the game fills this from the Mmogbrain tech tree JSON in
+// FUN_1403FFDE0 (YTechTreeManager.cpp), which offline never arrives. The
+// authored per-ship module lists survive in UYCachedItemIDData's
+// m_relatedItemIDs, so we rebuild the table from those.
+//
+// Entries are left fully zeroed apart from the three fields consumers read.
+// That is deliberate and load-bearing: FindShipTechTreeData hands the arrays
+// to the deep-copy at 0x3E9A30, whose element destructor (0x31C420) treats
+// entry+0x00 as a TArray of 0x20-stride records each holding a TArray of
+// 0x18-stride records, and frees entry+0x10 when non-null. A zeroed entry
+// makes every one of those a no-op, so nothing can be freed that we did not
+// allocate through UE4Malloc.
+static bool g_shipTechTreesPopulated = false;
+
+static void PopulateShipTechTrees(uint8_t *ttm) {
+  if (!ttm || g_shipTechTreesPopulated)
+    return;
+
+  struct FRawArray {
+    void *Data;
+    int32_t Count;
+    int32_t Max;
+  };
+  FRawArray *arr48 = (FRawArray *)(ttm + 0x48);
+
+  if (arr48->Count != 0) {
+    printf("[TECHTREE] TTM+0x48 already holds %d records - leaving it alone.\n",
+           arr48->Count);
+    g_shipTechTreesPopulated = true;
+    return;
+  }
+  if (g_shipRelatedItems.empty()) {
+    printf("[TECHTREE] No per-ship module lists discovered - cannot build "
+           "TTM+0x48.\n");
+    return;
+  }
+
+  EnsureUE4Allocators();
+
+  const int RECORD_SIZE = 0x28;
+  const int ITEM_ENTRY_SIZE = 0x48;
+
+  // Room for one record per ship plus one synthetic-ID alias per tech tree
+  // ship, since we do not yet know which ID space the screens query in.
+  int shipCount = (int)g_shipRelatedItems.size();
+  int capacity = shipCount + (int)g_FullTechTree.size() + 8;
+  uint8_t *records = (uint8_t *)UE4Malloc(capacity * RECORD_SIZE);
+  if (!records) {
+    printf("[TECHTREE] UE4Malloc failed for %d tech tree records.\n", capacity);
+    return;
+  }
+  memset(records, 0, capacity * RECORD_SIZE);
+
+  // real cache ID -> (items array, count), so alias records can point at the
+  // same module array. Sharing is safe: FindShipTechTreeData deep-copies via
+  // 0x3E9A30 into caller locals and never writes to or frees the source.
+  std::map<int32_t, std::pair<void *, int>> builtItems;
+
+  int recIdx = 0;
+  int totalModules = 0;
+  int skippedShips = 0;
+  for (auto const &kv : g_shipRelatedItems) {
+    int32_t shipId = kv.first;
+    const std::vector<std::pair<int32_t, uint8_t>> &mods = kv.second;
+    if (mods.empty()) {
+      skippedShips++;
+      continue;
+    }
+
+    int modCount = (int)mods.size();
+    uint8_t *items = (uint8_t *)UE4Malloc(modCount * ITEM_ENTRY_SIZE);
+    if (!items) {
+      skippedShips++;
+      continue;
+    }
+    memset(items, 0, modCount * ITEM_ENTRY_SIZE);
+
+    for (int i = 0; i < modCount; i++) {
+      uint8_t *item = items + i * ITEM_ENTRY_SIZE;
+      int32_t modId = mods[i].first;
+
+      // +0x20 is the only field FindShipTechTreeData's consumers dereference
+      // to identify the item; 0x541CD0 feeds it straight back into
+      // FindCachedDataEntry to recover m_loadoutItemType.
+      *(int32_t *)(item + 0x20) = modId;
+
+      auto it = g_discoveryCache.find(modId);
+      *(int32_t *)(item + 0x2C) =
+          (it != g_discoveryCache.end() && it->second.tier >= 1) ? it->second.tier
+                                                                 : 1;
+      *(char *)(item + 0x3C) = (char)mods[i].second;
+    }
+
+    uint8_t *rec = records + recIdx * RECORD_SIZE;
+    *(int64_t *)(rec + 0x00) = (int64_t)shipId;
+    *(void **)(rec + 0x08) = items;
+    *(int32_t *)(rec + 0x10) = modCount;
+    *(int32_t *)(rec + 0x14) = modCount;
+    // +0x18 proxy array stays null/0 - ProxyType items only exist in the
+    // server payload and no offline consumer reads them.
+
+    builtItems[shipId] = std::make_pair((void *)items, modCount);
+    recIdx++;
+    totalModules += modCount;
+  }
+
+  // Alias records under the synthetic tech tree IDs (11001+). The tech tree
+  // screens are reached through SetSelectedShip, which the mod translates
+  // synthetic -> real, but the ship detail panel and the progression counter
+  // reach the same lookup by other routes and may still be holding the
+  // synthetic ID. Answering both costs one extra record per ship.
+  int aliases = 0;
+  for (const auto &s : g_FullTechTree) {
+    if (recIdx >= capacity)
+      break;
+    if (s.realId == s.shipId || s.realId <= 0)
+      continue;
+    auto it = builtItems.find(s.realId);
+    if (it == builtItems.end())
+      continue;
+    uint8_t *rec = records + recIdx * RECORD_SIZE;
+    *(int64_t *)(rec + 0x00) = (int64_t)s.shipId;
+    *(void **)(rec + 0x08) = it->second.first;
+    *(int32_t *)(rec + 0x10) = it->second.second;
+    *(int32_t *)(rec + 0x14) = it->second.second;
+    recIdx++;
+    aliases++;
+  }
+
+  arr48->Data = records;
+  arr48->Count = recIdx;
+  arr48->Max = capacity;
+
+  printf("[TECHTREE] Added %d synthetic-ID alias records.\n", aliases);
+
+  printf("[TECHTREE] Built TTM+0x48: %d ship records, %d module entries "
+         "(%d ships skipped).\n",
+         recIdx, totalModules, skippedShips);
+
+  // Show the first few so the ID space is visible in the log - these must be
+  // real cache IDs (0x01FF0xxx), not synthetic 11001+ IDs.
+  //
+  // The "counted" column is the number the progression widget will actually
+  // display as its denominator. 0xAA9570 does not count every related item: it
+  // runs each through 0x541CD0, which returns the module's m_loadoutItemType
+  // straight out of the item cache, and keeps only types 2..6 -
+  // WEAPON_SECOND plus ABILITY_FIRST..FOURTH, the five rails on the tech tree
+  // screen. Everything else (primary weapon, officers, all the appearance
+  // items) is invisible to the counter, so a ship can carry a long
+  // m_relatedItemIDs list and still legitimately show 0.
+  // Watch list: IDs the tech tree screens have actually been observed querying,
+  // which are not necessarily the first ships in ID order. 33489198 is the one
+  // the Agosta's tech tree asks for, and it reports 10 related items where a
+  // typical ship has 18 - so its list needs seeing in full.
+  const int32_t watched[] = {33489198, 33489203, 33489222};
+
+  int shown = 0;
+  for (auto const &kv : g_shipRelatedItems) {
+    bool isWatched = false;
+    for (int w = 0; w < (int)(sizeof(watched) / sizeof(watched[0])); w++)
+      if (kv.first == watched[w])
+        isWatched = true;
+    if ((shown >= 5 && !isWatched) || kv.second.empty())
+      continue;
+    auto it = g_discoveryCache.find(kv.first);
+    int counted = 0;
+    for (const auto &m : kv.second) {
+      auto mi = g_discoveryCache.find(m.first);
+      if (mi != g_discoveryCache.end() && mi->second.loadoutItemType >= 2 &&
+          mi->second.loadoutItemType <= 6)
+        counted++;
+    }
+    printf("[TECHTREE]   ship %d (0x%08X) \"%s\": %d modules, %d counted\n",
+           kv.first, (uint32_t)kv.first,
+           it != g_discoveryCache.end() ? it->second.name.c_str() : "?",
+           (int)kv.second.size(), counted);
+    for (const auto &m : kv.second) {
+      auto mi = g_discoveryCache.find(m.first);
+      printf("[TECHTREE]       item %d (0x%08X) ident=%u loadoutType=%d "
+             "cachedType=%d \"%s\"\n",
+             m.first, (uint32_t)m.first, (unsigned)m.second,
+             mi != g_discoveryCache.end() ? mi->second.loadoutItemType : -1,
+             mi != g_discoveryCache.end() ? mi->second.itemType : -1,
+             mi != g_discoveryCache.end() ? mi->second.name.c_str()
+                                          : "NOT IN CACHE");
+    }
+    if (!isWatched)
+      shown++;
+  }
+
+  g_shipTechTreesPopulated = true;
 }
 
 void BuildSyntheticToRealMap() {
@@ -2459,6 +2829,292 @@ static void InitFullTechTree() {
   }
 }
 
+// ========================================================================
+// Ship tech tree item state
+//
+// EYTechTreeItemState (SDK/DreadGame_Structs.h:175) is:
+//     Invalid=0, Locked=1, Available=2, Researched=3, Owned=4
+//
+// Available(2) is the state that makes the UI offer a purchase. Every code
+// path that writes m_itemState (+0x40) must go through here so the tech tree
+// screen, the ship detail screen and the owned-ships screen never disagree
+// about whether a ship can be bought.
+// ========================================================================
+static uint8_t ComputeShipItemState(int32_t shipId) {
+  if (g_ownedShips.count(shipId) > 0)
+    return (uint8_t)EYTechTreeItemState::Owned;
+
+  const FTechTreeShip *ship = nullptr;
+  for (const auto &s : g_FullTechTree) {
+    if (s.shipId == shipId) {
+      ship = &s;
+      break;
+    }
+  }
+  if (!ship)
+    return (uint8_t)EYTechTreeItemState::Locked;
+
+  // Purchasable ships report Researched, not Available. Ghidra decompile of
+  // RequestTechTreePurchaseData (0x4C35F0) shows how EYTechTreeItemState maps
+  // onto EYItemActionAvailability:
+  //     Locked(1)     -> YIPA_RESEARCH_REQUIREMENTS_NOT_MET(4)
+  //     Available(2)  -> gated on XP    -> YIPA_NOT_ENOUGH_XP(3)
+  //     Researched(3) -> gated on money -> YIPA_AVAILABLE(1) when affordable
+  //     Owned(4)      -> YIPA_OWNED(6)
+  // Research and purchase are two separate steps in this game. Available means
+  // "may be researched with XP"; Researched means "may be bought with
+  // credits". Since ZeroItemPriceData drives every cost to 0, reporting
+  // Researched lands on YIPA_AVAILABLE and offers a one-click purchase.
+  // Deliberately NOT modelling progression here any more.
+  //
+  // Earlier versions invented rules ("any ship one tier below is owned", then
+  // "the same-class ship one tier below is owned"). Both were wrong: the real
+  // tree has cross-class prerequisites and branching paths, which no such rule
+  // can express.
+  //
+  // The engine already holds the correct graph. GetTechTreeItemState
+  // (0x543890) walks a TArray<int32> of prerequisite item IDs at entry+0x10 â€”
+  // the same edges the UI draws its arrows from â€” and evaluates each one by
+  // asking whether it is researched/purchased. Those two questions are what
+  // MyHookHasResearchedScan / MyHookHasPurchasedScan now answer from our
+  // profile, so the engine derives the correct state by itself.
+  //
+  // This value is only a fallback for callers that patch a struct without an
+  // engine-computed state to hand. Anything not owned is reported Locked so we
+  // never claim a ship is buyable when the real graph says otherwise.
+  return (uint8_t)EYTechTreeItemState::Locked;
+}
+
+// The engine's own EYTechTreeItemState resolver (RVA 0x53C870), called by
+// FUN_1404f6b50 while it fills FYUITechTreeItemPurchaseData:
+//     m_itemState (+0x1D8) = FUN_14053c870(entry, worldCtx, ctxId)
+// and RequestTechTreePurchaseData then derives m_actionAvailability (+0x128)
+// from that one byte. Hooking here means the tech tree screen, the purchase
+// popup and the availability text all agree without patching each separately.
+//
+// This is a real function body, not a UFunction exec thunk (it is called
+// directly rather than registered by name), so the register signature is
+// straightforward. The item ID lives at entry+0x20.
+typedef uint8_t(__fastcall *tResolveTechTreeItemState)(void *entry,
+                                                       void *worldCtx,
+                                                       int32_t ctxId);
+static tResolveTechTreeItemState OrigResolveTechTreeItemState = nullptr;
+
+uint8_t __fastcall MyHookResolveTechTreeItemState(void *entry, void *worldCtx,
+                                                  int32_t ctxId) {
+  uint8_t original = 0;
+  if (OrigResolveTechTreeItemState)
+    original = OrigResolveTechTreeItemState(entry, worldCtx, ctxId);
+
+  if (!entry)
+    return original;
+
+  int32_t rawID = *(int32_t *)((uint8_t *)entry + 0x20);
+  int32_t itemID = ResolveToSyntheticShipId(rawID);
+  if (itemID < 0) {
+    static int unmapped = 0;
+    if (unmapped < 60) {
+      tee_printf("[TECHSTATE] raw id 0x%08X (%d) not a known ship -> engine=%d\n",
+                 (uint32_t)rawID, rawID, (int)original);
+      unmapped++;
+    }
+    return original;
+  }
+
+  // Owned ships are the one case the engine cannot reach on its own:
+  // GetTechTreeItemState's early "return 4" scans the Mmogbrain owned-items
+  // array inline (Mmogbrain+0x3F90) rather than going through the
+  // HasPurchasedItem helper we hook, so that path stays empty offline.
+  //
+  // Everything else is deliberately left to the engine. With the ownership
+  // helpers hooked, GetTechTreeItemState walks the real prerequisite graph at
+  // entry+0x10 and produces correct Locked / Available / Researched values,
+  // including cross-class branches that no hand-written rule could express.
+  if (g_ownedShips.count(itemID) > 0) {
+    static int ownedLog = 0;
+    if (ownedLog < 400) {
+      tee_printf("[TECHSTATE] item %d (raw 0x%08X): engine=%d -> Owned(4)\n",
+                 itemID, (uint32_t)rawID, (int)original);
+      ownedLog++;
+    }
+    return (uint8_t)EYTechTreeItemState::Owned;
+  }
+
+  static int stateLog = 0;
+  if (stateLog < 400) {
+    tee_printf("[TECHSTATE] item %d (raw 0x%08X): engine=%d (deferring)\n",
+               itemID, (uint32_t)rawID, (int)original);
+    stateLog++;
+  }
+
+  return original;
+}
+
+// YTechTreeManager entry lookup (RVA 0x3F51A0), called as
+//     found = FUN_1403f51a0(ttm, itemID, &outEntry)
+// by GetTechTreeItemState (0x543890), the purchase data populator (0x4F6B50)
+// and CanResearchItem (0x31E880).
+//
+// The tech tree manager is populated with our synthetic IDs, but
+// SetSelectedShip translates synthetic -> real before handing the selection
+// on, so the ship detail panel looks the ship up by its real cache ID. That
+// lookup misses, the caller is left holding a zeroed entry, and the state
+// resolver then sees itemID 0 and cannot answer â€” which is exactly the
+// "raw id 0x00000000 not a known ship" seen in the log on every ship click.
+//
+// Translating real -> synthetic here fixes every caller at once instead of
+// patching each one, and leaves IDs the map does not know untouched.
+typedef char(__fastcall *tFindTechTreeEntry)(void *ttm, int32_t itemID,
+                                             void *outEntry);
+static tFindTechTreeEntry OrigFindTechTreeEntry = nullptr;
+
+char __fastcall MyHookFindTechTreeEntry(void *ttm, int32_t itemID,
+                                        void *outEntry) {
+  if (!OrigFindTechTreeEntry)
+    return 0;
+
+  char found = OrigFindTechTreeEntry(ttm, itemID, outEntry);
+  if (found)
+    return found;
+
+  // Miss: retry under the other dialect.
+  int32_t synth = ResolveToSyntheticShipId(itemID);
+  if (synth > 0 && synth != itemID) {
+    char retried = OrigFindTechTreeEntry(ttm, synth, outEntry);
+    static int xlateLog = 0;
+    if (xlateLog < 60) {
+      tee_printf("[TTLOOKUP] real 0x%08X missed, retried as synth %d -> %s\n",
+                 (uint32_t)itemID, synth, retried ? "FOUND" : "still missing");
+      xlateLog++;
+    }
+    return retried;
+  }
+  return found;
+}
+
+// The two Mmogbrain-backed entitlement scans that GetTechTreeItemState relies
+// on to evaluate prerequisites (decompiles at 0x547DD0 and 0x548990). Both walk
+// an int array hanging off the Mmogbrain online subsystem:
+//     0x547DD0 -> researched items (Mmogbrain+0x3F80, count +0x3F88)
+//     0x548990 -> purchased items  (Mmogbrain+0x3F90, count +0x3F98)
+// Offline both arrays are empty, so every prerequisite evaluates unsatisfied
+// and every ship collapses to Locked(1) -> YIPA_RESEARCH_REQUIREMENTS_NOT_MET.
+// Answering from our own profile lets the engine's real graph work.
+typedef uint64_t(__fastcall *tItemEntitlementScan)(int32_t itemID);
+static tItemEntitlementScan OrigHasResearchedScan = nullptr;
+static tItemEntitlementScan OrigHasPurchasedScan = nullptr;
+
+uint64_t __fastcall MyHookHasResearchedScan(int32_t itemID) {
+  int32_t synth = ResolveToSyntheticShipId(itemID);
+  if (synth > 0 && g_ownedShips.count(synth) > 0)
+    return 1;
+  return OrigHasResearchedScan ? OrigHasResearchedScan(itemID) : 0;
+}
+
+uint64_t __fastcall MyHookHasPurchasedScan(int32_t itemID) {
+  int32_t synth = ResolveToSyntheticShipId(itemID);
+  if (synth > 0 && g_ownedShips.count(synth) > 0)
+    return 1;
+  return OrigHasPurchasedScan ? OrigHasPurchasedScan(itemID) : 0;
+}
+
+// Read a UE4 FString (Data@0x00, Count@0x08, Max@0x0C) into an owned
+// std::wstring. Count includes the null terminator.
+static std::wstring ReadFStringUE4(const void *fstringPtr) {
+  if (!fstringPtr)
+    return L"";
+  const wchar_t *data = *(const wchar_t *const *)fstringPtr;
+  int32_t count = *(const int32_t *)((const uint8_t *)fstringPtr + 0x08);
+  if (!data || count <= 1 || count > 4096)
+    return L"";
+  return std::wstring(data, (size_t)(count - 1));
+}
+
+// FYUIItemPriceData (SDK/DreadGame_Structs.h:5558):
+//   m_shipXP 0x00, m_freeXP 0x04, m_softCurrency 0x08, m_hardCurrency 0x0C,
+//   m_realCurrency 0x10 (float), m_currencyCode 0x18 (FString).
+//
+// With no live catalog the game fills the XP fields with -1, and the tech tree
+// reports "Research Requirements Not Met" because a -1 requirement can never
+// be satisfied. We run a free-but-explicit economy offline, so every ship
+// costs nothing. The FString at 0x18 is deliberately left alone â€” it belongs
+// to the engine.
+static void ZeroItemPriceData(uint8_t *price) {
+  if (!price)
+    return;
+  *(int32_t *)(price + 0x00) = 0; // m_shipXP
+  *(int32_t *)(price + 0x04) = 0; // m_freeXP
+  *(int32_t *)(price + 0x08) = 0; // m_softCurrency
+  *(int32_t *)(price + 0x0C) = 0; // m_hardCurrency
+  *(float *)(price + 0x10) = 0.0f; // m_realCurrency
+}
+
+// Presentation strings captured from engine-built tech tree structs, keyed by
+// synthetic ship ID. The owned-ships screen has to build its array by hand
+// (the engine only ever returns entries for ships the dead server knew about),
+// and leaving these empty is what produces nameless white boxes. Deep copies,
+// not raw pointers â€” the engine owns and frees the originals.
+struct FShipUiStrings {
+  std::wstring iconPath;
+  std::wstring categoryImagePath;
+  std::wstring manufacturerLogoPath;
+};
+static std::map<int32_t, FShipUiStrings> g_shipUiStrings;
+
+// Offsets within FYUIShipManufacturerTechItemData (total 0x180).
+static const int UIITEM_ICONPATH = 0x20;
+static const int UIITEM_CATEGORYIMAGEPATH = 0x30;
+static const int UIITEM_RESEARCHPRICE = 0x48;
+static const int UIITEM_PURCHASEPRICE = 0x78;
+static const int UIITEM_MFGLOGOPATH = 0x138;
+
+// Walk one GetManufacturerData outArr1 (stride 0x28 stack entries, each with a
+// TArray of 0x180 item structs) and harvest presentation strings from every
+// ship it contains.
+static void CaptureShipUiStringsFromStackArray(void *stackArray);
+
+// Capture presentation strings from a real engine-built item struct, but only
+// when they are non-empty so a later empty rebuild cannot erase a good value.
+static void CaptureShipUiStrings(int32_t shipId, const uint8_t *item) {
+  if (!item)
+    return;
+  FShipUiStrings &dst = g_shipUiStrings[shipId];
+  std::wstring icon = ReadFStringUE4(item + UIITEM_ICONPATH);
+  std::wstring category = ReadFStringUE4(item + UIITEM_CATEGORYIMAGEPATH);
+  std::wstring logo = ReadFStringUE4(item + UIITEM_MFGLOGOPATH);
+  if (!icon.empty())
+    dst.iconPath = icon;
+  if (!category.empty())
+    dst.categoryImagePath = category;
+  if (!logo.empty())
+    dst.manufacturerLogoPath = logo;
+}
+
+static void CaptureShipUiStringsFromStackArray(void *stackArray) {
+  if (!stackArray)
+    return;
+  uint8_t *data = *(uint8_t **)((uint8_t *)stackArray + 0x00);
+  int32_t count = *(int32_t *)((uint8_t *)stackArray + 0x08);
+  if (!data || count <= 0 || count > 256)
+    return;
+
+  const int STACK_ENTRY_SIZE = 0x28;
+  const int ITEM_SIZE = 0x180;
+  for (int i = 0; i < count; i++) {
+    uint8_t *stackEntry = data + i * STACK_ENTRY_SIZE;
+    uint8_t *itemsData = *(uint8_t **)(stackEntry + 0x00);
+    int32_t itemsCount = *(int32_t *)(stackEntry + 0x08);
+    if (!itemsData || itemsCount <= 0 || itemsCount > 64)
+      continue;
+    for (int j = 0; j < itemsCount; j++) {
+      uint8_t *item = itemsData + j * ITEM_SIZE;
+      int32_t itemID = *(int32_t *)(item + 0x08);
+      if (itemID >= 11000 && itemID <= 19999)
+        CaptureShipUiStrings(itemID, item);
+    }
+  }
+}
+
 // Hook on FUN_140480f70 (UYCachedItemIDData::FindCachedDataEntry)
 typedef uint64_t(__fastcall *tFindCachedDataEntry)(uint32_t param1,
                                                    void **outPtr);
@@ -2516,17 +3172,33 @@ uint64_t __fastcall MyHookFindCachedDataEntry(uint32_t param1, void **outPtr) {
     }
   }
 
-  typedef void *(__fastcall * fn_GetCachedSingleton)();
-  auto GetCacheSingleton = (fn_GetCachedSingleton)(g_moduleBase + 0x4813A0);
-  void *cacheSingleton = GetCacheSingleton();
-
-  if (cacheSingleton) {
-    void *cacheData = *(void **)((uint8_t *)cacheSingleton + 0x28);
-    int32_t cacheCount = *(int32_t *)((uint8_t *)cacheSingleton + 0x30);
-    if (cacheData && cacheCount > 0) {
-      *outPtr = cacheData;
-      return 1;
-    }
+  // A miss must report a miss.
+  //
+  // This used to end with a catch-all that fetched the cache singleton and
+  // handed back entry[0] - the first record in the array - for any ID it could
+  // not resolve, returning 1 as though the lookup had succeeded. Every caller
+  // then read a completely unrelated item's fields.
+  //
+  // The tech tree is where that showed up worst. UYCachedItemIDData's 3086
+  // entries do not include ships' weapons or abilities (the 0x040E/0x050E
+  // ranges), so every one of them took the fallback, and the classifier at
+  // 0x541CD0 - whose first act is FindCachedDataEntry, returning
+  // m_loadoutItemType from the entry - read entry[0]'s type. Entry[0] is a
+  // ship, and ships carry m_loadoutItemType 19 (SHIP_CLASS). So every module
+  // in the game classified as 19, failed the "type is 2..6" test that decides
+  // what belongs on a tech tree rail, and the screen counted nothing. The
+  // giveaway was item ID 0xFFFFFFFF - an empty officer slot - also classifying
+  // as 19 rather than failing.
+  //
+  // Returning 0 lets 0x541CD0 fall through to its own class-based resolution,
+  // which is the path it was written to take. Logged rather than silent: if
+  // something else was quietly depending on the old behaviour, the log will
+  // name the IDs.
+  static int missLog = 0;
+  if (missLog < 30) {
+    tee_printf("[DATA] FindCachedDataEntry: 0x%08X (%u) not in cache -> miss\n",
+               param1, param1);
+    missLog++;
   }
   return 0;
 }
@@ -2600,6 +3272,33 @@ uint64_t __fastcall MyHookGetManufacturerData(int32_t manufacturerId,
       uint8_t *itemsData = *(uint8_t **)(stackEntry + 0x00);
       int32_t itemsCount = *(int32_t *)(stackEntry + 0x08);
 
+      // m_Prerequisites: TArray<int32_t> at +0x18 of the 0x28-stride stack
+      // struct (SDK/DreadGame_Structs.h:9439). This is the engine's real tech
+      // tree graph. Logged so the hand-rolled progression model in
+      // ComputeShipItemState can be replaced with actual edges.
+      if (g_logTechTree) {
+        static int prereqLog = 0;
+        if (prereqLog < 60) {
+          int32_t *prereqData = *(int32_t **)(stackEntry + 0x18);
+          int32_t prereqCount = *(int32_t *)(stackEntry + 0x20);
+          int32_t firstItemId =
+              (itemsData && itemsCount > 0) ? *(int32_t *)(itemsData + 0x08) : -1;
+          if (prereqCount > 0 && prereqCount < 64 && prereqData) {
+            char buf[256];
+            int off = 0;
+            for (int p = 0; p < prereqCount && off < 200; p++) {
+              off += snprintf(buf + off, sizeof(buf) - off, "%d ", prereqData[p]);
+            }
+            printf("[PREREQ] stack %d (item %d): %d prereqs -> %s\n", i,
+                   firstItemId, prereqCount, buf);
+          } else {
+            printf("[PREREQ] stack %d (item %d): no prerequisites (count=%d)\n",
+                   i, firstItemId, prereqCount);
+          }
+          prereqLog++;
+        }
+      }
+
       for (int j = 0; j < itemsCount && itemsData; j++) {
         uint8_t *item = itemsData + j * ITEM_SIZE;
         int32_t itemID = *(int32_t *)(item + 0x08); // m_itemID
@@ -2615,8 +3314,22 @@ uint64_t __fastcall MyHookGetManufacturerData(int32_t manufacturerId,
               *(int32_t *)(item + 0x0C) = s.tier;
               // Override m_manufacturerID (+0x04)
               *(int32_t *)(item + 0x04) = s.manufacturerId;
-              // Override m_itemState (+0x40) = Owned
-              *(uint8_t *)(item + 0x40) = 3;
+              // m_itemState (+0x40): only assert ownership. This used to be
+              // hardcoded to 3 (Researched) for every ship, which made all 52
+              // look unlocked and suppressed the purchase button. Non-owned
+              // ships keep whatever GetTechTreeItemState computed from the
+              // real prerequisite graph â€” overwriting that here would throw
+              // away the engine's answer.
+              if (g_ownedShips.count(itemID) > 0)
+                *(uint8_t *)(item + 0x40) =
+                    (uint8_t)EYTechTreeItemState::Owned;
+
+              // Harvest the engine's presentation strings for this ship so the
+              // owned-ships screen can reuse them, then clear the -1 price
+              // sentinels that block research/purchase offline.
+              CaptureShipUiStrings(itemID, item);
+              ZeroItemPriceData(item + UIITEM_RESEARCHPRICE);
+              ZeroItemPriceData(item + UIITEM_PURCHASEPRICE);
               fixCount++;
 
               // Build mapping from potential internal IDs to synthetic ID.
@@ -2647,6 +3360,36 @@ uint64_t __fastcall MyHookGetManufacturerData(int32_t manufacturerId,
         }
       }
     }
+    // Warm the presentation-string cache for the manufacturers the player has
+    // not browsed yet.
+    //
+    // g_shipUiStrings is only filled for trees that have actually been opened,
+    // so the Owned Ships screen rendered Jupiter Arms ships with artwork and
+    // every Akula Vektor / Oberon ship as a nameless white box. Query the
+    // other two manufacturers once, purely to harvest their strings.
+    //
+    // The output arrays are intentionally not freed: the engine's own callers
+    // free these with a bespoke per-element loop (see decompile of 0x4ED0C0),
+    // and getting that wrong is far more expensive than leaking one array per
+    // manufacturer once per session.
+    static bool s_warmedAllManufacturers = false;
+    if (!s_warmedAllManufacturers && OrigGetManufacturerData) {
+      s_warmedAllManufacturers = true;
+      for (int mfg = 0; mfg < 3; mfg++) {
+        if (mfg == manufacturerId)
+          continue;
+        uint8_t warmArr1[16] = {0};
+        uint8_t warmArr2[16] = {0};
+        if (OrigGetManufacturerData(mfg, warmArr1, warmArr2, worldContext) == 1) {
+          CaptureShipUiStringsFromStackArray(warmArr1);
+          printf("[UISTRINGS] Warmed manufacturer %d (cache now %d ships)\n", mfg,
+                 (int)g_shipUiStrings.size());
+        } else {
+          printf("[UISTRINGS] Warm query for manufacturer %d failed\n", mfg);
+        }
+      }
+    }
+
     if (fixCount > 0 && g_logTechTree) {
       printf("[DATA] Post-processed outArr1: fixed %d synthetic ships (name + "
              "class + tier)\n",
@@ -2971,6 +3714,22 @@ void __fastcall MyHookGetUIShipData(UObject *Context, void *Stack,
   if (frame && frame->Locals) {
     FYUIShipManufacturerTechItemData *pData =
         *(FYUIShipManufacturerTechItemData **)frame->Locals;
+
+    // A null check alone is not sufficient here. This pointer comes out of the
+    // Blueprint frame and can reference an array the engine has already freed
+    // â€” clicking a ship on the Owned Ships screen (whose filter widget owns
+    // this UFunction) reliably produced a write fault at the same address on
+    // every run. Verify the whole struct is committed and writable first.
+    if (pData && !IsWritableMemory(pData, sizeof(FYUIShipManufacturerTechItemData))) {
+      static int staleLog = 0;
+      if (staleLog < 40) {
+        tee_printf("[UISHIPDATA] Stale/unwritable pData %p - skipping patch\n",
+                   (void *)pData);
+        staleLog++;
+      }
+      pData = nullptr;
+    }
+
     if (pData) {
       originalItemId = pData->m_itemID;
 
@@ -3454,24 +4213,16 @@ void __fastcall MyHookGetShipData(UObject *Context, void *Stack,
           *(int32_t *)(pResult + 0x0C) = s.tier;           // m_tier
           *(uint8_t *)(pResult + 0x0150) =
               (uint8_t)s.shipClass; // m_shipClass (EYShipClass)
-          bool isOwned = g_ownedShips.count(itemID) > 0;
-          uint8_t shipState = 0; // 0 = Locked by Prerequisite
-          if (isOwned) {
-            shipState = 3; // 3 = Unlocked / Owned
-          } else if (s.tier == 1) {
-            shipState = 1; // 1 = Purchasable (Tier 1 starters)
-          } else {
-            // Check if any ship of the same manufacturer in the previous tier is owned
-            for (const auto &prev : g_FullTechTree) {
-              if (prev.manufacturerId == s.manufacturerId && prev.tier == (s.tier - 1)) {
-                if (g_ownedShips.count(prev.shipId) > 0) {
-                  shipState = 1; // Lower-tier prerequisite met -> Purchasable
-                  break;
-                }
-              }
-            }
-          }
-          *(uint8_t *)(pResult + 0x40) = shipState;
+          // m_itemState (+0x40). The previous inline version used enum values
+          // taken from comments that contradicted the SDK (0/1/3 for
+          // "locked/purchasable/owned"), so no ship ever reached Available(2)
+          // and none ever reached Owned(4). Now only ownership is asserted;
+          // the engine's prerequisite-derived state is left alone otherwise.
+          if (g_ownedShips.count(itemID) > 0)
+            *(uint8_t *)(pResult + 0x40) = (uint8_t)EYTechTreeItemState::Owned;
+          CaptureShipUiStrings(itemID, pResult);
+          ZeroItemPriceData(pResult + UIITEM_RESEARCHPRICE);
+          ZeroItemPriceData(pResult + UIITEM_PURCHASEPRICE);
           InitFStringUE4(pResult + 0x10, s.name.c_str()); // m_name (FString)
 
           // Track the last synthetic ship queried â€” this is how we identify
@@ -4132,7 +4883,14 @@ void __fastcall MyHookAABF50(void *param_1, void *param_2, void *param_3,
 
 void __fastcall MyHookIsItemOwnedByPlayer(UObject *Context, void *Stack,
                                           void *RESULT_DECL) {
-  bool owned = true;
+  // Run the original first: it advances FFrame::Code past EX_EndFunctionParms
+  // and leaves a real answer in RESULT_DECL. Skipping it corrupted the
+  // bytecode stream, the same defect found in the owned-ships and HasItem
+  // hooks.
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OriginalIsItemOwnedByPlayerFunc)
+    ((OrigFunc)OriginalIsItemOwnedByPlayerFunc)(Context, Stack, RESULT_DECL);
+
   struct FFrame {
     void *Node;
     UObject *Object;
@@ -4140,32 +4898,124 @@ void __fastcall MyHookIsItemOwnedByPlayer(UObject *Context, void *Stack,
     uint8_t *Locals;
   };
   FFrame *frame = (FFrame *)Stack;
+  int32_t itemId = -1;
   if (frame && frame->Locals) {
     FUIGenericButtonModuleData *pData =
         *(FUIGenericButtonModuleData **)frame->Locals;
-    if (pData) {
-      int32_t itemId = pData->m_itemID;
-      if (itemId >= 11000 && itemId <= 19999) {
-        owned = (g_ownedShips.count(itemId) > 0);
-      }
-    }
+    // Same stale-pointer hazard as MyHookGetUIShipData. This one only reads,
+    // so it is less destructive, but a freed pointer still faults.
+    if (pData && IsWritableMemory(pData, sizeof(FUIGenericButtonModuleData)))
+      itemId = pData->m_itemID;
   }
-  if (RESULT_DECL) {
-    *(bool *)RESULT_DECL = owned;
+
+  // Only speak when we positively recognise the item. This used to default to
+  // "owned = true", so any item whose ID could not be read reported as owned â€”
+  // which is why unowned ships such as Machias displayed OWNED.
+  int32_t synth = ResolveToSyntheticShipId(itemId);
+  if (synth > 0) {
+    bool owned = g_ownedShips.count(synth) > 0;
+    static int ownLog = 0;
+    if (ownLog < 200) {
+      tee_printf("[OWNCHECK] IsItemOwnedByPlayer(raw %d -> synth %d) -> %s\n",
+                 itemId, synth, owned ? "true" : "false");
+      ownLog++;
+    }
+    if (RESULT_DECL)
+      *(bool *)RESULT_DECL = owned;
+  } else {
+    static int unkLog = 0;
+    if (unkLog < 60) {
+      tee_printf("[OWNCHECK] IsItemOwnedByPlayer(id=%d unresolved) -> leaving "
+                 "engine answer %d\n",
+                 itemId, RESULT_DECL ? (int)*(uint8_t *)RESULT_DECL : -1);
+      unkLog++;
+    }
   }
 }
 
 // Native UFunction override for IsCurrentShipOwnedByPlayer
 void __fastcall MyHookIsCurrentShipOwnedByPlayer(UObject *Context, void *Stack,
                                                  void *RESULT_DECL) {
-  bool owned = true;
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OriginalIsCurrentShipOwnedByPlayerFunc)
+    ((OrigFunc)OriginalIsCurrentShipOwnedByPlayerFunc)(Context, Stack,
+                                                       RESULT_DECL);
+
+  // g_lastClickedSyntheticId is only refreshed on certain paths, so it goes
+  // stale as soon as the player browses the tree without triggering a loadout
+  // switch. Combined with the old "default to owned" behaviour that produced
+  // the inverted display: an unowned ship reading OWNED while an owned ship
+  // asked for research.
+  //
+  // Log what we are basing the answer on so the staleness is visible rather
+  // than silently wrong.
   int32_t currentId = g_lastClickedSyntheticId;
-  if (currentId >= 11000 && currentId <= 19999) {
-    owned = (g_ownedShips.count(currentId) > 0);
+  static int curLog = 0;
+  if (curLog < 200) {
+    tee_printf("[OWNCHECK] IsCurrentShipOwnedByPlayer: lastClicked=%d engine=%d\n",
+               currentId, RESULT_DECL ? (int)*(uint8_t *)RESULT_DECL : -1);
+    curLog++;
   }
-  if (RESULT_DECL) {
-    *(bool *)RESULT_DECL = owned;
+
+  int32_t synthCurrent = ResolveToSyntheticShipId(currentId);
+  if (synthCurrent > 0) {
+    if (RESULT_DECL)
+      *(bool *)RESULT_DECL = (g_ownedShips.count(synthCurrent) > 0);
   }
+}
+
+// UI_ShipDetailsSubPanel::GetShipResearchPurchaseState.
+//
+// This is what actually drives the research/claim/owned button, and it is
+// none of the enums chased earlier. Extracting
+// UI_EditShip_Details_ResearchClaimButton.uasset from custompakchunk0 showed
+// the widget switching on EYShipResearchPurchaseState and selecting between
+// NotResearchedNotPurchasedReqsNotMet / ...ReqsMet / ResearchedNotPurchased...
+// / ResearchedPurchased button data. That enum comes from here:
+//
+//   0 NotResearchedNotPurchasedRequirementsNotMet -> "RESEARCH REQUIREMENTS NOT MET"
+//   1 NotResearchedNotPurchasedRequirementsMet    -> research offered
+//   2 ResearchedNotPurchasedRequirementsNotMet    -> "SHIP RESEARCHED, NEED MORE TECH TO CLAIM"
+//   3 ResearchedNotPurchasedRequirementsMet       -> claim / purchase offered
+//   4 ResearchedPurchased                         -> "OWNED"
+//
+// The panel has no ship parameter, so we use g_lastClickedSyntheticId, which
+// ProcessSetSelectedShip refreshes on every ship click immediately before this
+// panel is built.
+//
+// Free-but-explicit economy: an unowned ship reports state 3, so the player is
+// offered a purchase with no XP or credit requirement standing in the way.
+static void *OrigGetShipResearchPurchaseStateFunc = nullptr;
+
+void __fastcall MyHookGetShipResearchPurchaseState(UObject *Context, void *Stack,
+                                                   void *RESULT_DECL) {
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigGetShipResearchPurchaseStateFunc)
+    ((OrigFunc)OrigGetShipResearchPurchaseStateFunc)(Context, Stack,
+                                                     RESULT_DECL);
+  if (!RESULT_DECL)
+    return;
+
+  uint8_t engineState = *(uint8_t *)RESULT_DECL;
+  int32_t synth = ResolveToSyntheticShipId((int32_t)g_lastClickedSyntheticId);
+  if (synth <= 0)
+    return;
+
+  uint8_t ours =
+      (g_ownedShips.count(synth) > 0)
+          ? (uint8_t)EYShipResearchPurchaseState::ResearchedPurchased
+          : (uint8_t)EYShipResearchPurchaseState::
+                ResearchedNotPurchasedRequirementsMet;
+
+  static int rpsLog = 0;
+  if (rpsLog < 200) {
+    tee_printf("[SHIPSTATE] ship %d: engine=%d -> %d (%s)\n", synth,
+               (int)engineState, (int)ours,
+               (g_ownedShips.count(synth) > 0) ? "OWNED" : "purchasable");
+    rpsLog++;
+  }
+
+  *(uint8_t *)RESULT_DECL = ours;
 }
 
 template <typename T> void TArrayAddSafe(TArray<T> &arr, const T &item) {
@@ -4222,6 +5072,7 @@ void InjectOfflineFleet(AYPlayerController *pc) {
   UYLoadoutManagerComponent *lmc =
       (UYLoadoutManagerComponent *)pc->m_loadoutManager;
   UYFleetManager *fm = (UYFleetManager *)pc->m_fleetManager;
+  g_fleetManagerPtr = fm;
 
   printf("[FLEET] Beginning fleet restoration (pak-verified assets)...\n");
 
@@ -4547,6 +5398,8 @@ void InjectOfflineFleet(AYPlayerController *pc) {
         uint8_t *entry = *entriesData + (e * 0x30);
         UObject **loadoutArr = *(UObject ***)(entry);
         int32_t loadoutCount = *(int32_t *)(entry + 0x08);
+        // See LoadedShipInfo::loadoutEntryKey - the engine's own lookup key.
+        int32_t entryKey = *(int32_t *)(entry + 0x20);
 
         // Only take the first loadout per entry (Loadout[0]).
         // Each entry has 2 identical loadouts (default + active copy), and
@@ -4578,6 +5431,7 @@ void InjectOfflineFleet(AYPlayerController *pc) {
           info.loadoutObj = loadout;
           info.precastID = precastID;
           info.shipClass = (EYShipClass)shipClass;
+          info.loadoutEntryKey = entryKey;
 
           // Normalize Class 13 (Support Heavy) to 12 (Support Medium) to fix UI
           // icons
@@ -4612,11 +5466,14 @@ void InjectOfflineFleet(AYPlayerController *pc) {
           try {
             if (namePtr && namePtr->c_str()) {
               std::string nameStr = namePtr->ToString();
-              if (g_numLoadedShips < 3)
-                printf("[FLEET]   %s (class %d, tier %d)\n", nameStr.c_str(),
-                       shipClass, info.tier);
-              else if (g_numLoadedShips == 3)
-                printf("[FLEET]   ... (reading remaining entries)\n");
+              // Print every entry, including entryKey and precastID. The fleet
+              // picker hands the engine a shipID that must equal entryKey or
+              // AddShipToFleet dies with "Loadout is NULL", so the full table is
+              // needed to build a correct mapping. 65 lines is cheap.
+              printf("[LOADOUTKEY] entry=%d key=%d precastID=%d class=%d "
+                     "tier=%d name=%s\n",
+                     e, entryKey, precastID, shipClass, info.tier,
+                     nameStr.c_str());
               // Store wide name for UI
               int len = (int)nameStr.length();
               if (len > 63)
@@ -4638,6 +5495,48 @@ void InjectOfflineFleet(AYPlayerController *pc) {
       }
       printf("[FLEET] Loaded %d ship records for UI population\n",
              g_numLoadedShips);
+
+      // Bridge the synthetic tech-tree IDs onto the loadout manager's own key
+      // space. Matching is by exact name: both tables spell the ships
+      // identically ("Cerberus", "Orcus", ...), and exact equality keeps the
+      // dev/hero duplicates ("Zmey 1", "Svarog 2", "DEV_...") from capturing a
+      // base ship. Class and tier are checked afterwards purely to catch a bad
+      // match - they are not used to pick one, because several ships share a
+      // class/tier pair and guessing between them is how earlier mappings went
+      // wrong.
+      g_syntheticToLoadoutKey.clear();
+      {
+        int mapped = 0, missing = 0, suspect = 0;
+        for (const FTechTreeShip &s : g_FullTechTree) {
+          const LoadedShipInfo *hit = nullptr;
+          for (int i = 0; i < g_numLoadedShips; i++) {
+            if (g_loadedShips[i].name[0] == 0)
+              continue;
+            if (s.name == g_loadedShips[i].name) {
+              hit = &g_loadedShips[i];
+              break;
+            }
+          }
+          if (!hit) {
+            missing++;
+            printf("[LOADOUTMAP] WARN no loadout entry named '%ls' "
+                   "(synthetic %d) - it cannot be added to a fleet\n",
+                   s.name.c_str(), s.shipId);
+            continue;
+          }
+          if (hit->tier != s.tier) {
+            suspect++;
+            printf("[LOADOUTMAP] WARN '%ls' tier mismatch: tech tree says %d, "
+                   "loadout says %d - mapping anyway on the name\n",
+                   s.name.c_str(), s.tier, hit->tier);
+          }
+          g_syntheticToLoadoutKey[s.shipId] = hit->loadoutEntryKey;
+          mapped++;
+        }
+        printf("[LOADOUTMAP] %d of %d tech tree ships mapped to loadout keys "
+               "(%d unmatched, %d suspect)\n",
+               mapped, (int)g_FullTechTree.size(), missing, suspect);
+      }
 
       // Rebuild g_loadoutMap from g_loadedShips so click handlers can find
       // the correct ship by (shipClass * 10 + tier). This replaces the
@@ -4716,28 +5615,53 @@ void InjectOfflineFleet(AYPlayerController *pc) {
         matchCount = 5;
       }
 
-      int32_t *loadoutIndices =
-          (int32_t *)UE4Malloc(matchCount * sizeof(int32_t));
-      bool *veteranStatus = (bool *)UE4Malloc(matchCount * sizeof(bool));
-      memset(veteranStatus, 0, matchCount * sizeof(bool));
+      // fleet+0x00 is TArray<int32> of *cache ship IDs*, not indices into
+      // g_loadedShips. Established from two independent engine readers:
+      //   UYFleetManager::AddLoadoutToFleet (0x338660) walks this array and
+      //   compares each element against loadout->vtable[0x1E8](), and passes
+      //   that same value to the eligibility check (0x34DF50), which forwards it
+      //   to 0x540030 -> 0x480F70 -> reads m_tier at cacheEntry+0xF8. Only a
+      //   cache ID resolves through that path; a 0..64 index lands on the wrong
+      //   entry or none, so the fleet's membership test and tier check were both
+      //   operating on nonsense.
+      // Allocate the full 5 slots up front even when fewer ships are owned.
+      // AddLoadoutToFleet never grows this array itself - on success it just
+      // forwards the request to Mmogbrain (0x338660 tail: resolve "YMmogbrain",
+      // then FUN_142A15430) and waits for HandleMmogbrainAddedToFleet, which
+      // cannot arrive offline. The mod therefore appends in place, and doing so
+      // is only safe if the spare capacity already exists - reallocating an
+      // array the engine holds a raw pointer into would be far riskier.
+      const int kFleetCapacity = 5;
+      int32_t *fleetShipIds =
+          (int32_t *)UE4Malloc(kFleetCapacity * sizeof(int32_t));
+      memset(fleetShipIds, 0, kFleetCapacity * sizeof(int32_t));
+      bool *veteranStatus = (bool *)UE4Malloc(kFleetCapacity * sizeof(bool));
+      memset(veteranStatus, 0, kFleetCapacity * sizeof(bool));
+
+      // Parallel list of m_loadoutEntries indices for the same ships. Only used
+      // locally to resolve loadout objects for fleet+0x28; it must not be the
+      // thing handed to the engine at fleet+0x00.
+      std::vector<int> entryIndices;
+      entryIndices.reserve(matchCount);
 
       int idx = 0;
       for (int i = 0; i < entriesNum && i < g_numLoadedShips && idx < matchCount; i++) {
         int tier = g_loadedShips[i].tier;
         if (tier >= fleetDefs[f].minTier && tier <= fleetDefs[f].maxTier) {
           if (isLoadedShipOwned(g_loadedShips[i])) {
-            loadoutIndices[idx++] = i;
+            fleetShipIds[idx++] = g_loadedShips[i].loadoutEntryKey;
+            entryIndices.push_back(i);
           }
         }
       }
 
-      *(int32_t **)(fleet + 0x00) = loadoutIndices;
-      *(int32_t *)(fleet + 0x08) = matchCount;
-      *(int32_t *)(fleet + 0x0C) = matchCount;
+      *(int32_t **)(fleet + 0x00) = fleetShipIds;
+      *(int32_t *)(fleet + 0x08) = matchCount;      // Num
+      *(int32_t *)(fleet + 0x0C) = kFleetCapacity;  // Max - room to append
 
       *(bool **)(fleet + 0x10) = veteranStatus;
       *(int32_t *)(fleet + 0x18) = matchCount;
-      *(int32_t *)(fleet + 0x1C) = matchCount;
+      *(int32_t *)(fleet + 0x1C) = kFleetCapacity;
 
       *(uint64_t *)(fleet + 0x20) = (uint64_t)(f + 1);
 
@@ -4747,8 +5671,8 @@ void InjectOfflineFleet(AYPlayerController *pc) {
         UObject **resolvedLoadouts =
             (UObject **)UE4Malloc(maxLoadouts * sizeof(UObject *));
         int resolvedCount = 0;
-        for (int s = 0; s < maxLoadouts && s < matchCount; s++) {
-          int entryIdx = loadoutIndices[s];
+        for (int s = 0; s < maxLoadouts && s < (int)entryIndices.size(); s++) {
+          int entryIdx = entryIndices[s];
           if (entryIdx >= 0 && entryIdx < entriesNum) {
             uint8_t *entry = *entriesData + (entryIdx * 0x30);
             UObject **entryLoadouts = *(UObject ***)(entry);
@@ -4765,10 +5689,97 @@ void InjectOfflineFleet(AYPlayerController *pc) {
 
       *(int32_t *)(fleet + 0x38) = 5;
       *(uint8_t *)(fleet + 0x40) = fleetDefs[f].fleetType;
+      // Flagship, same ID space as the membership array above.
       if (matchCount > 0)
-        *(int32_t *)(fleet + 0x44) = loadoutIndices[0];
+        *(int32_t *)(fleet + 0x44) = fleetShipIds[0];
     }
     printf("[FLEET] Created 3 standard fleets on FleetManager %p\n", fm);
+
+    // Populate m_fleetEligibiliyConfigTable.
+    //
+    // Offline this table is empty, and an empty table is not a permissive
+    // default - it is a hard deny. UYFleetManager::IsLoadoutEligibleForFleet
+    // (RVA 0x34DF50) walks the table looking for an entry whose type byte
+    // matches the fleet, and on falling off the end returns
+    //   (ulonglong)tier & 0xffffffffffffff00
+    // whose low byte - the bool the caller reads - is always 0. So every
+    // AddLoadoutToFleet would report "Loadout [x] not eligible on fleet [y]"
+    // even once the loadout lookup succeeds. It is normally filled by
+    // YFleetManager::HandleMmogbrainEligibiltyTableUpdate, which cannot fire
+    // with the servers down.
+    //
+    // Values come from DefaultFleet.ini (Recruit=(1,2), Veteran=(2,3),
+    // Legendary=(4,5)), which is the same source the live game would have used.
+    // The maintenance/rating fields are left zeroed to match the free-but-
+    // explicit economy. The type byte is copied from the fleet we just built
+    // rather than hardcoded, so the two can never disagree.
+    {
+      const int CFG_ENTRY_SIZE = 0x28;
+      const int cfgCount = 3;
+      uint8_t *cfgData = (uint8_t *)UE4Malloc(cfgCount * CFG_ENTRY_SIZE);
+      memset(cfgData, 0, cfgCount * CFG_ENTRY_SIZE);
+
+      for (int f = 0; f < cfgCount; f++) {
+        uint8_t *cfg = cfgData + f * CFG_ENTRY_SIZE;
+        uint8_t *fleet = fleetData + f * FLEET_ENTRY_SIZE;
+
+        // m_allowedTiers: TArray<int32> at entry+0x00 / count +0x08 / max +0x0C
+        int32_t tierCount = fleetDefs[f].maxTier - fleetDefs[f].minTier + 1;
+        int32_t *tiers = (int32_t *)UE4Malloc(tierCount * sizeof(int32_t));
+        for (int t = 0; t < tierCount; t++)
+          tiers[t] = fleetDefs[f].minTier + t;
+
+        *(int32_t **)(cfg + 0x00) = tiers;
+        *(int32_t *)(cfg + 0x08) = tierCount;
+        *(int32_t *)(cfg + 0x0C) = tierCount;
+        // m_fleetType at entry+0x24, matched against the fleet's own byte.
+        uint8_t fleetType = *(uint8_t *)(fleet + 0x40);
+        *(uint8_t *)(cfg + 0x24) = fleetType;
+
+        if (g_numFleetTierRanges < 8) {
+          g_fleetTierRanges[g_numFleetTierRanges].fleetType = fleetType;
+          g_fleetTierRanges[g_numFleetTierRanges].minTier = fleetDefs[f].minTier;
+          g_fleetTierRanges[g_numFleetTierRanges].maxTier = fleetDefs[f].maxTier;
+          g_numFleetTierRanges++;
+        }
+      }
+
+      TArrayRaw *pCfgTable = (TArrayRaw *)((uint8_t *)fm + 0x0060);
+      pCfgTable->data = cfgData;
+      pCfgTable->count = cfgCount;
+      pCfgTable->max = cfgCount;
+    }
+
+    // Dump m_fleetEligibiliyConfigTable straight off the FleetManager. Layout
+    // established by decompiling the eligibility check at RVA 0x34DF50, which
+    // walks data at this+0x60 / count at this+0x68 with stride 0x28, compares
+    // the fleet type byte at entry+0x24, then tests whether the TArray<int32> at
+    // entry+0x00 contains the loadout's tier. DefaultFleet.ini declares
+    // Recruit=(1,2), Veteran=(2,3), Legendary=(4,5); this prints what actually
+    // loaded, which is what the picker has to filter against.
+    {
+      uint8_t *cfgBase = (uint8_t *)fm + 0x60;
+      if (IsWritableMemory(cfgBase, 12)) {
+        uint8_t *cfgData = *(uint8_t **)cfgBase;
+        int32_t cfgCount = *(int32_t *)(cfgBase + 0x08);
+        printf("[FLEETCFG] eligibility table: %d entries\n", cfgCount);
+        for (int c = 0; c < cfgCount && c < 16 && cfgData; c++) {
+          uint8_t *cfg = cfgData + (c * 0x28);
+          if (!IsWritableMemory(cfg, 0x28))
+            break;
+          uint8_t fleetType = *(uint8_t *)(cfg + 0x24);
+          int32_t *tiers = *(int32_t **)(cfg + 0x00);
+          int32_t tierCount = *(int32_t *)(cfg + 0x08);
+          char tierList[64] = {};
+          int off = 0;
+          for (int t = 0; t < tierCount && t < 8 && tiers; t++)
+            off += snprintf(tierList + off, sizeof(tierList) - off, "%s%d",
+                            t ? "," : "", tiers[t]);
+          printf("[FLEETCFG]   fleetType=%d allowedTiers=[%s]\n", fleetType,
+                 tierList);
+        }
+      }
+    }
   }
 
   // Fire FleetManager delegates so UI knows data is ready
@@ -4969,6 +5980,131 @@ void InjectOfflineFleet(AYPlayerController *pc) {
       if (found == 0) {
         printf("[UI] No non-CDO UYUIData instances found\n");
       }
+    }
+
+    // Game mode lists. UI_Screen_SelectGameMode's BuildGameModeList calls
+    // UI_GameModeSelectionScreen::GetAvailableGameModes and builds one button
+    // per element, so an empty return renders a screen with nothing on it -
+    // exactly what the Select Game Mode screen does offline.
+    //
+    // UYUIData carries two lists (DreadGame_Classes.h):
+    //   m_gameModeList          @ 0x00A8  - Edit, designer-authored, in the pak
+    //   m_availableGameModeList @ 0x0098  - BlueprintReadOnly, the live subset
+    // If the authored list survives offline then the repair is a copy rather
+    // than fabricating FYMenuGameModeDefinition (0x70 bytes, with FString and
+    // FText members) by hand. This dump establishes which of those it is, and
+    // on which object the authored data actually lives - for manufacturers the
+    // real data was on the Blueprint subclass CDO, not Default__YUIData.
+    if (uidataClass) {
+      printf("[GAMEMODE] Scanning UYUIData objects for game mode lists...\n");
+      int scanned = 0;
+      for (int i = 0; i < UObject::GObjects->Count() && scanned < 40; i++) {
+        UObject *obj = UObject::GObjects->GetByIndex(i);
+        if (!obj || !obj->IsA(uidataClass))
+          continue;
+        TArrayRaw *avail = (TArrayRaw *)((uint8_t *)obj + 0x0098);
+        TArrayRaw *full = (TArrayRaw *)((uint8_t *)obj + 0x00A8);
+        if (!IsWritableMemory(avail, 0x20))
+          continue;
+        scanned++;
+        std::string name;
+        try {
+          name = obj->GetFullName();
+        } catch (...) {
+          name = "<unreadable>";
+        }
+        printf("[GAMEMODE]   %s: available=%d authored=%d\n", name.c_str(),
+               avail->Count, full->Count);
+
+        // Point the available list at the authored one.
+        //
+        // This is an alias, not a copy: both TArrays end up referring to the
+        // same buffer. That is deliberate. FYMenuGameModeDefinition is 0x70
+        // bytes containing FString and FText members, so a byte-wise copy would
+        // duplicate their internal pointers without touching the refcounts and
+        // risk a double free when the copy died. Aliasing avoids owning the
+        // memory at all.
+        //
+        // Safe because both arrays live on the same CDO (identical lifetime,
+        // never destroyed mid-session) and m_availableGameModeList is
+        // BlueprintReadOnly, so no Blueprint can Add/Empty it and trigger a
+        // realloc of a buffer it does not own. The only native writer is the
+        // server-fill path, which cannot run offline.
+        if (avail->Count == 0 && full->Count > 0 && full->Data &&
+            IsWritableMemory(full->Data, sizeof(void *))) {
+          avail->Data = full->Data;
+          avail->Count = full->Count;
+          avail->Max = full->Count;
+          printf("[GAMEMODE]     -> published %d game modes\n", full->Count);
+        }
+
+        // Dump the definitions. FYMenuGameModeDefinition is 0x70 bytes:
+        //   m_gameMode     FString @ 0x00   (the mode's string id)
+        //   m_calloutName  FString @ 0x10
+        //   m_gameModeType byte    @ 0x50   (EYGameModeType)
+        //   m_locked       bool    @ 0x6A   (BlueprintReadOnly - drives greying)
+        // The screen shows all 12 but only Proving Grounds is selectable, so
+        // m_locked is the field to check before assuming the others need new
+        // data rather than just an unlock.
+        if (full->Count > 0 && full->Data) {
+          for (int g = 0; g < full->Count && g < 32; g++) {
+            uint8_t *def = full->Data + (size_t)g * 0x70;
+            if (!IsWritableMemory(def, 0x70))
+              break;
+            std::string modeId, callout;
+            try {
+              modeId = ((FString *)(def + 0x00))->ToString();
+              callout = ((FString *)(def + 0x10))->ToString();
+            } catch (...) {
+            }
+            printf("[GAMEMODE]     [%d] type=%d locked=%d id='%s' callout='%s'\n",
+                   g, (int)*(uint8_t *)(def + 0x50),
+                   (int)*(uint8_t *)(def + 0x6A), modeId.c_str(),
+                   callout.c_str());
+          }
+        }
+
+        // Map table. YMenu::StartMatchmaking takes (EYGameModeType, FString
+        // fullMapPath), so the map path is an explicit parameter rather than
+        // something the server chooses - which makes a direct local launch
+        // possible without Mmogbrain. Dump what is actually authored.
+        //   m_multiplayerMaps @ 0x0028, TArray<FYMPGameMap>, stride 0x70
+        //   m_PVEEvents       @ 0x0068, TArray<FYGameMap>,   stride 0x68
+        // FYGameMap: m_mapName FName@0x00, m_mapPath FName@0x20,
+        //            m_isTutorial bool@0x60.
+        struct MapArrayDef {
+          uint32_t offset;
+          uint32_t stride;
+          const char *label;
+        };
+        const MapArrayDef mapArrays[] = {
+            {0x0028, 0x70, "multiplayer"},
+            {0x0068, 0x68, "pve"},
+        };
+        for (const MapArrayDef &ma : mapArrays) {
+          TArrayRaw *arr = (TArrayRaw *)((uint8_t *)obj + ma.offset);
+          if (!IsWritableMemory(arr, 0x10) || arr->Count <= 0 || !arr->Data)
+            continue;
+          printf("[MAPS]   %s: %s has %d entries\n", name.c_str(), ma.label,
+                 arr->Count);
+          for (int m = 0; m < arr->Count && m < 40; m++) {
+            uint8_t *entry = arr->Data + (size_t)m * ma.stride;
+            if (!IsWritableMemory(entry, ma.stride))
+              break;
+            std::string mapName, mapPath;
+            try {
+              mapName = ((FName *)(entry + 0x00))->GetName();
+              mapPath = ((FName *)(entry + 0x20))->GetName();
+            } catch (...) {
+              continue;
+            }
+            printf("[MAPS]     [%d] name=%s path=%s tutorial=%d\n", m,
+                   mapName.c_str(), mapPath.c_str(),
+                   (int)*(uint8_t *)(entry + 0x60));
+          }
+        }
+      }
+      printf("[GAMEMODE] Scanned %d UYUIData objects\n", scanned);
     }
 
     // === CRITICAL: Inject into ALL AYMenu instances (CDO + live actors) at
@@ -5221,6 +6357,189 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
 
   std::string funcName = function->GetFullName();
 
+  // === AUDIT TRACER ===
+  // Six targeted fixes (entitlement scans, state resolver, TTM lookup, ID
+  // translation, ownership hooks) all verified correct in the log, and the
+  // ship detail panel still renders the same values. That means the panel is
+  // driven by code we have not identified, so stop inferring the data flow
+  // from the SDK and observe it instead: every Blueprint/native call passes
+  // through here, so log the ones plausibly involved in ownership, research
+  // and purchase, with the object they were called on.
+  //
+  // Toggle with the `dread.trace` console-ish global; default on until the
+  // audit is finished.
+  if (g_auditTraceEnabled) {
+    static const char *kTraceKeys[] = {
+        "Purchase", "Research", "Owned",   "Claim",    "TechTree",
+        "Acquire",  "Unlock",   "HasItem", "ItemState", "Entitle",
+        // Added while chasing the Owned Ships click crash: the last event
+        // before the fault is ShipFocused, so widen coverage to whatever the
+        // click path touches next.
+        "Loadout",  "Focus",    "Select",  "Detail",
+        // Fleet management â€” the next milestone. UYFleetManager waits on
+        // HandleMmogbrainAddedToFleet, a server callback that can never
+        // arrive offline, so find what the screen really calls.
+        "Fleet",    "Flagship", "AddShip", "Slot",
+        // Match entry. The PLAY button did not reach AYMenu::StartMatchmaking
+        // (RVA 0x4D18D0) at all - the hook there never fired - so the UI must
+        // take a different route into matchmaking than the one the SDK's
+        // YMatchmakingInterpreter signature suggested. Observe it rather than
+        // guess at a third candidate.
+        "Matchmaking", "FindAMatch", "StartMatch", "Queue", "Battle",
+        "GameModeLaunch"};
+    // Per-frame callers burn the whole budget before anything interesting
+    // happens. UI_Persistent_MatchmakingTimer.Tick and GameMode.ReadyToStartMatch
+    // alone accounted for 3926 of 4000 traced calls in one session, which is
+    // why the trace showed the matchmaking timer running but never showed what
+    // started it. Drop them before they consume a slot.
+    static const char *kTraceNoise[] = {"Tick", "ReadyToStartMatch",
+                                        "PreConstruct"};
+    bool isNoise = false;
+    for (const char *n : kTraceNoise) {
+      if (funcName.find(n) != std::string::npos) {
+        isNoise = true;
+        break;
+      }
+    }
+
+    if (!isNoise) {
+      for (const char *key : kTraceKeys) {
+        if (funcName.find(key) != std::string::npos) {
+          static int traceCount = 0;
+          if (traceCount < 4000) {
+            tee_printf("[TRACE] %s | on %s\n", funcName.c_str(),
+                       object ? object->GetName().c_str() : "<null>");
+            traceCount++;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // === SHIP PURCHASE ===
+  //
+  // Runtime tracing of a CLAIM NOW click shows this exact chain, ten clicks
+  // producing ten of each and nothing after:
+  //     ResearchClaimButton_C.BndEvt__Button_0_...OnButtonClickedEvent
+  //     UI_EditShip_Panel_ShipDetails_C.OnButtonResearchClaimButtonClicked
+  //     UI_EditShip_Panel_ShipDetails_C.OnPurchaseShip
+  //
+  // The Blueprint raises the purchase intent correctly and then has nobody to
+  // ask â€” the transaction lived on Mmogbrain. We settle it locally instead.
+  //
+  // g_lastClickedSyntheticId is refreshed by ProcessSetSelectedShip on every
+  // ship click, immediately before this panel is built, so it identifies the
+  // ship the player is looking at. Cost is 0 under the free-but-explicit
+  // economy: the player must still choose to buy, but nothing blocks it.
+  if (funcName.find("UI_EditShip_Panel_ShipDetails_C.OnPurchaseShip") !=
+      std::string::npos) {
+    int32_t synth = ResolveToSyntheticShipId((int32_t)g_lastClickedSyntheticId);
+    if (synth > 0) {
+      if (g_ownedShips.count(synth) > 0) {
+        tee_printf("[PURCHASE] Ship %d already owned, ignoring claim\n", synth);
+      } else if (UnlockShipAndSave(synth, 0)) {
+        tee_printf("[PURCHASE] CLAIM NOW granted ship %d. Owned ships now %d\n",
+                   synth, (int)g_ownedShips.size());
+
+        // Tell the screen the transaction completed.
+        //
+        // The live flow was: click -> show m_processingPurchasePopupWidget ->
+        // server replies -> HandlePurchaseCompleted(true) -> popup dismissed
+        // and the panel refreshed. We granted the ship without ever closing
+        // that loop, which is why the button only updated after navigating
+        // away and back. Driving the game's own completion handler is
+        // preferable to hand-refreshing widgets.
+        //
+        // Deferred to the main-thread queue rather than called inline: we are
+        // currently inside ProcessEvent for OnPurchaseShip, and re-entering
+        // the VM from here risks unwinding through a frame the engine is
+        // still using.
+        ProcInMainThread([]() {
+          UFunction *fn = (UFunction *)GetObjByName(
+              "Function DreadGameUI.UI_EditShipScreen.HandlePurchaseCompleted");
+          if (!fn) {
+            tee_printf("[PURCHASE] HandlePurchaseCompleted UFunction not found\n");
+            return;
+          }
+          UUI_EditShipScreen *screen = nullptr;
+          for (UUI_EditShipScreen *s :
+               UObject::FindObjects<UUI_EditShipScreen>()) {
+            if (!s)
+              continue;
+            // Skip class default objects; we want the live widget.
+            if (s->GetFullName().find("Default__") != std::string::npos)
+              continue;
+            screen = s;
+          }
+          if (!screen) {
+            tee_printf("[PURCHASE] No live UI_EditShipScreen to notify\n");
+            return;
+          }
+          struct {
+            bool wasSuccessful;
+          } params = {true};
+          if (pProcessEvent_Original)
+            pProcessEvent_Original((UObject *)screen, fn, &params);
+          tee_printf("[PURCHASE] Notified %s HandlePurchaseCompleted(true)\n",
+                     screen->GetName().c_str());
+
+          // The screen-level notification is not enough on its own.
+          //
+          // The CLAIM button caches its state: the extracted Blueprint
+          // UI_EditShip_Details_ResearchClaimButton has
+          // shipResearchPurchaseStateCache / shipPurchaseCostCache /
+          // shipResearchCostCache, refreshed only when the panel re-runs Setup.
+          // Confirmed in the log - after the screen notification fired, no
+          // further GetShipResearchPurchaseState query happened at all, so the
+          // button kept painting the value it had cached before the purchase.
+          //
+          // UI_EditShip_Panel_ShipDetails_C has its *own* parameterless
+          // HandlePurchaseCompleted; the panel is what owns the button, so that
+          // is the one that can invalidate the cache.
+          UFunction *panelFn = (UFunction *)GetObjByName(
+              "Function UI_EditShip_Panel_ShipDetails."
+              "UI_EditShip_Panel_ShipDetails_C.HandlePurchaseCompleted");
+          if (!panelFn) {
+            tee_printf("[PURCHASE] Panel HandlePurchaseCompleted not found\n");
+            return;
+          }
+          // Setup is what re-reads the state and refills the button's caches.
+          // HandlePurchaseCompleted alone provably is not enough: notifying the
+          // panels produced no GetShipResearchPurchaseState query in the log, so
+          // it clears the in-progress flag without rebuilding anything.
+          UFunction *setupFn = (UFunction *)GetObjByName(
+              "Function UI_EditShip_Panel_ShipDetails."
+              "UI_EditShip_Panel_ShipDetails_C.Setup");
+
+          int notified = 0;
+          for (UObject *o : UObject::FindObjects<UObject>()) {
+            if (!o)
+              continue;
+            std::string full = o->GetFullName();
+            if (full.find("UI_EditShip_Panel_ShipDetails_C ") ==
+                std::string::npos)
+              continue;
+            if (full.find("Default__") != std::string::npos)
+              continue;
+            if (pProcessEvent_Original) {
+              pProcessEvent_Original(o, panelFn, nullptr);
+              if (setupFn)
+                pProcessEvent_Original(o, setupFn, nullptr);
+            }
+            notified++;
+          }
+          tee_printf("[PURCHASE] Notified %d ShipDetails panel(s) (Setup=%s)\n",
+                     notified, setupFn ? "yes" : "MISSING");
+        });
+      }
+    } else {
+      tee_printf("[PURCHASE] CLAIM NOW fired but no ship resolved "
+                 "(lastClicked=%d)\n",
+                 (int)g_lastClickedSyntheticId);
+    }
+  }
+
   // === MONARCH INVISIBILITY FIX: Override item ownership for Tyr vanity parts ===
   if (funcName.find("YCtAInventoryInterface.HasItem") != std::string::npos) {
     if (pProcessEvent_Original) {
@@ -5254,18 +6573,33 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
 
 
 
-  // Capture the CustomisationPreview actor when it ticks, as it is a verified
-  // ticking target
-  if (funcName.find("CustomisationPreview_BP_C:ReceiveTick") !=
-      std::string::npos) {
-    if (!IsValidUObject(g_customizationPreviewActor)) {
-      g_customizationPreviewActor = object;
-    } else if (object != g_customizationPreviewActor) {
-      if (object->InternalIndex > g_customizationPreviewActor->InternalIndex) {
-        g_customizationPreviewActor = object;
-      }
-    }
-
+  // Monarch (T5 Jupiter Arms Dreadnought) hero-part application.
+  //
+  // NOTE: this used to test for "CustomisationPreview_BP_C:ReceiveTick" with a
+  // colon, copied from LogScript's call-stack formatting. funcName comes from
+  // UObject::GetFullName(), which joins outers with '.' and never emits a
+  // colon (SDK/CoreUObject_Package.cpp:1123), so the condition could never be
+  // true and ApplyMonarchHeroParts was never called even once.
+  //
+  // g_customizationPreviewActor is deliberately NOT written here. The level
+  // actor scan in UGameEngineTick owns that global; adding a second writer on
+  // the far hotter ProcessEvent path risks destabilising the 3D viewport for
+  // every other ship.
+  // DISABLED 2026-07-29. Correcting the separator made this fire for the first
+  // time ever. Result: the first call reported a successful merge but the
+  // Monarch still did not render, the next 9 calls all failed with "Could not
+  // find MergeShipMeshParts UFunction", and shortly after switching to another
+  // ship a background thread entered a sequential-scan AV storm from a null
+  // base (faults walking 0x0,0x8,0x10...0x40) at RVA 0xD1D6E0. The VEH killed
+  // that thread and the game froze. Neither the AV pattern nor the thread kill
+  // appears anywhere in the pre-change baseline log, so this code is the cause.
+  //
+  // Re-enable only after ApplyMonarchHeroParts is made safe: run once rather
+  // than per-tick, resolve MergeShipMeshParts before mutating anything, and
+  // gate on the Monarch specifically (ship 11014) instead of matching "DreadH".
+  if (false &&
+      funcName.find("CustomisationPreview_BP_C.ReceiveTick") !=
+          std::string::npos) {
     if (object) {
       std::string objFullName = object->GetFullName();
       if (objFullName.find("MN_HGR_DREADH") != std::string::npos || objFullName.find("DreadH") != std::string::npos || objFullName.find("DreadnoughtHeavy") != std::string::npos) {
@@ -5558,6 +6892,19 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
         printf("[CACHE] Item ID probe: %d/%d found in %d cache entries\n",
                foundCount, numTest, cacheArr->Count);
 
+        // Read the authored item cache now, unconditionally.
+        //
+        // ScanCacheForTiers used to be reachable only from
+        // MyHookFindCachedDataEntry's miss path, gated on a synthetic ID in
+        // 11001..15999 - a query the game never actually makes, so the scan
+        // never ran once in a whole session. That left g_discoveryCache and
+        // g_moduleItemIds empty, which is why the log read
+        // "TTM populated: ... 0 modules" and every per-ship tech tree was
+        // blank. InitFullTechTree first because the scan's tail calls
+        // BuildSyntheticToRealMap, which needs g_FullTechTree.
+        InitFullTechTree();
+        ScanCacheForTiers();
+
         // From Ghidra analysis of FUN_1403ffde0 (server response parser):
         // TTM+0x38 = TArray of manufacturer groups (stride 0x28 = 40 bytes per
         // entry) Each entry layout:
@@ -5787,6 +7134,12 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
                    NUM_MFGS, classIdx, (int)g_moduleItemIds.size());
           }
         }
+
+        // The per-ship tech trees at TTM+0x48. Independent of the
+        // manufacturer groups above, and deliberately outside the
+        // "arr38->Count == 0" guard - this table has its own emptiness check
+        // and must be built even if the manufacturer groups already exist.
+        PopulateShipTechTrees(ttm);
       } else {
         printf("[TTM] No UYCachedItemIDData singleton found.\n");
       }
@@ -9155,12 +10508,62 @@ static LONG WINAPI BackgroundThreadVEH(PEXCEPTION_POINTERS pExInfo) {
     // to jumping to garbage addresses (seen: 0xFFFF8009501D0000 -> runaway AV
     // storm).
     //
-    // Safe alternative: kill this background thread.
-    // This is a TaskGraph worker thread â€” the scheduler spawns replacements.
-    // The main thread (g_mainThreadId) is guarded above and is never killed.
-    printf("[VEH] Spin-loop at RVA 0x%llX or sequential scan (tid=%u, hit=%d) "
-           "-> ExitThread\n",
-           (unsigned long long)rva, currentThread, hitCountSnap);
+    // The claim that this is always "a TaskGraph worker the scheduler will
+    // replace" was never verified. UE4 names its threads, so ask Windows which
+    // one we are about to destroy before doing it. Killing RenderThread or
+    // the RHI thread leaves the game running with audio but no window, which
+    // is precisely the reported Owned Ships symptom.
+    wchar_t *threadName = nullptr;
+    char nameUtf8[128] = "<unnamed>";
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &threadName)) &&
+        threadName) {
+      WideCharToMultiByte(CP_UTF8, 0, threadName, -1, nameUtf8,
+                          sizeof(nameUtf8) - 1, nullptr, nullptr);
+      LocalFree(threadName);
+    }
+
+    // The reported "RVA" is meaningless when RIP is outside the game module
+    // (0x3D4CC9B2C is ~16GB past the base). Identify the module RIP actually
+    // sits in, and note that the faulting data address is identical on every
+    // occurrence â€” a fixed pointer, not random corruption.
+    char ripModule[MAX_PATH] = "<unknown>";
+    uintptr_t ripOffset = 0;
+    HMODULE ripMod = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)rip, &ripMod) &&
+        ripMod) {
+      char fullPath[MAX_PATH] = {};
+      if (GetModuleFileNameA(ripMod, fullPath, MAX_PATH)) {
+        const char *slash = strrchr(fullPath, '\\');
+        strncpy_s(ripModule, slash ? slash + 1 : fullPath, _TRUNCATE);
+      }
+      ripOffset = rip - (uintptr_t)ripMod;
+    }
+    printf("[VEH] fault detail: rip=%p module=%s+0x%llX faultAddr=%p tid=%u\n",
+           (void *)rip, ripModule, (unsigned long long)ripOffset,
+           (void *)faultAddr, currentThread);
+
+    // Never kill a thread whose name marks it as structurally load-bearing.
+    // Suppressing the fault and continuing may still misbehave, but it cannot
+    // take the renderer down outright.
+    bool loadBearing =
+        (strstr(nameUtf8, "Render") != nullptr) ||
+        (strstr(nameUtf8, "RHI") != nullptr) ||
+        (strstr(nameUtf8, "Audio") != nullptr) ||
+        (strstr(nameUtf8, "Game") != nullptr);
+
+    printf("[VEH] Spin-loop at RVA 0x%llX (tid=%u name='%s' hit=%d) -> %s\n",
+           (unsigned long long)rva, currentThread, nameUtf8, hitCountSnap,
+           loadBearing ? "SUPPRESSED (load-bearing thread, not killed)"
+                       : "ExitThread");
+
+    if (loadBearing) {
+      // Skip the faulting instruction rather than terminating the thread.
+      pExInfo->ContextRecord->Rip += 1;
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     ExitThread(0);
     // ExitThread never returns, but the VEH needs a return value for the
     // compiler:
@@ -9344,40 +10747,79 @@ static LONG WINAPI BackgroundThreadVEH(PEXCEPTION_POINTERS pExInfo) {
   return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+// The owned-ships hook hands the engine an array it allocated itself, so the
+// C++ sizeof must match the real UE4 layout exactly. If the SDK generator got
+// padding wrong the stride is wrong and the consumer walks off the end of the
+// buffer. Verified against SDK/DreadGame_Structs.h:8205 (FullSize 0x180) and
+// :8161 (FYUIItemData FullSize 0x128).
+static_assert(sizeof(FYUIShipManufacturerTechItemData) == 0x180,
+              "FYUIShipManufacturerTechItemData stride mismatch");
+static_assert(sizeof(FYUIItemData) == 0x128, "FYUIItemData size mismatch");
+static_assert(offsetof(FYUIItemData, m_itemState) == 0x40,
+              "m_itemState offset mismatch");
+
 static void* oGetOwnedShipDataStructs = nullptr;
 static void* oGetOwnedShipLoadouts = nullptr;
 static void* oViewShipDetailsClicked = nullptr;
 
-static void* __fastcall hkGetOwnedShipDataStructs(TArray<FYUIShipManufacturerTechItemData>* pOutArray, UUI_OwnedShipsScreen* pThis) {
-  InitFullTechTree();
+// GetOwnedShipDataStructs â€” UFunction exec thunk.
+//
+// RVA 0xBB9530 is NOT the C++ implementation. Ghidra decompile of
+// FUN_140b057d0 shows the native registrar doing:
+//     RegisterNativeFunc(DreadGameUI, "GetOwnedShipDataStructs", FUN_140bb9530)
+// and FUN_140bb9530 itself advances FFrame::Code at +0x20 (P_FINISH) before
+// delegating to the real body at 0xACB760 and copying the result into
+// RESULT_DECL. So the signature is the standard exec thunk:
+//     (UObject* Context /*RCX*/, FFrame& Stack /*RDX*/, void* RESULT_DECL /*R8*/)
+//
+// The previous version hooked it as (TArray* /*RCX*/, UUI_OwnedShipsScreen*
+// /*RDX*/). RCX is actually the widget UObject, so writing the TArray fields
+// through it overwrote the object's vtable pointer (+0x00), ObjectFlags
+// (+0x08) and InternalIndex (+0x0C), and RESULT_DECL was never written at all.
+// That is why the hook logged success and the game froze on the next virtual
+// call, and why the caller saw "m_loadouts of length 0".
+//
+// We call the original first so FFrame::Code is advanced correctly and the
+// engine constructs a valid TArray, then replace its contents.
+static void* OrigGetOwnedShipDataStructsFunc = nullptr;
+static void* OrigGetOwnedShipLoadoutsFunc = nullptr;
 
-  std::vector<const FTechTreeShip*> ownedList;
-  for (const auto &s : g_FullTechTree) {
-    if (g_ownedShips.count(s.shipId) > 0 || (s.shipId == 11001 && g_ownedShips.count(61) > 0)) {
-      ownedList.push_back(&s);
-    }
+// Build a TArray<FYUIShipManufacturerTechItemData> describing the given ships.
+//
+// Shared by the Owned Ships screen and the Add Ship To Fleet screen: both
+// UFunctions return this exact array type, and both were returning nothing
+// useful offline because the data lived on Mmogbrain.
+//
+// Every field the UI reads must be filled. Leaving the presentation strings
+// zeroed is what produced nameless white boxes, and the price structs must be
+// zeroed rather than left at the engine's -1 sentinels.
+static void FillShipDataArray(TArray<FYUIShipManufacturerTechItemData> *pOutArray,
+                              const std::vector<const FTechTreeShip *> &ships,
+                              bool markInFleet, const char *tag) {
+  if (!pOutArray)
+    return;
+  int count = (int)ships.size();
+  if (count <= 0) {
+    pOutArray->_data = nullptr;
+    pOutArray->_count = 0;
+    pOutArray->_max = 0;
+    return;
   }
 
-  if (ownedList.empty()) {
-    for (const auto &s : g_FullTechTree) {
-      if (s.shipId == 11001) {
-        ownedList.push_back(&s);
-        break;
-      }
-    }
+  pOutArray->_data = (FYUIShipManufacturerTechItemData *)UE4Malloc(
+      sizeof(FYUIShipManufacturerTechItemData) * count);
+  if (!pOutArray->_data) {
+    pOutArray->_count = 0;
+    pOutArray->_max = 0;
+    return;
   }
-
-  int count = (int)ownedList.size();
-  tee_printf("[OWNED_SHIPS] hkGetOwnedShipDataStructs: Returning %d owned ships from profile\n", count);
-
-  pOutArray->_data = (FYUIShipManufacturerTechItemData*)UE4Malloc(sizeof(FYUIShipManufacturerTechItemData) * count);
   pOutArray->_count = count;
   pOutArray->_max = count;
-
-  memset(pOutArray->_data, 0, sizeof(FYUIShipManufacturerTechItemData) * count);
+  memset(pOutArray->_data, 0,
+         sizeof(FYUIShipManufacturerTechItemData) * count);
 
   for (int i = 0; i < count; i++) {
-    const FTechTreeShip *s = ownedList[i];
+    const FTechTreeShip *s = ships[i];
     FYUIShipManufacturerTechItemData &data = pOutArray->_data[i];
 
     data.m_manufacturerID = s->manufacturerId;
@@ -9386,10 +10828,12 @@ static void* __fastcall hkGetOwnedShipDataStructs(TArray<FYUIShipManufacturerTec
 
     if (!s->name.empty()) {
       size_t len = s->name.length();
-      data.m_name._data = (wchar_t*)UE4Malloc(sizeof(wchar_t) * (len + 1));
-      wcscpy(data.m_name._data, s->name.c_str());
-      data.m_name._count = (int32_t)(len + 1);
-      data.m_name._max = (int32_t)(len + 1);
+      data.m_name._data = (wchar_t *)UE4Malloc(sizeof(wchar_t) * (len + 1));
+      if (data.m_name._data) {
+        wcscpy(data.m_name._data, s->name.c_str());
+        data.m_name._count = (int32_t)(len + 1);
+        data.m_name._max = (int32_t)(len + 1);
+      }
     }
 
     data.m_shipClass = (EYShipClass)s->shipClass;
@@ -9403,33 +10847,142 @@ static void* __fastcall hkGetOwnedShipDataStructs(TArray<FYUIShipManufacturerTec
       case 12: case 13: classNameStr = L"Tactical Cruiser"; break;
     }
     size_t classLen = wcslen(classNameStr);
-    data.m_shipClassName._data = (wchar_t*)UE4Malloc(sizeof(wchar_t) * (classLen + 1));
-    wcscpy(data.m_shipClassName._data, classNameStr);
-    data.m_shipClassName._count = (int32_t)(classLen + 1);
-    data.m_shipClassName._max = (int32_t)(classLen + 1);
+    data.m_shipClassName._data =
+        (wchar_t *)UE4Malloc(sizeof(wchar_t) * (classLen + 1));
+    if (data.m_shipClassName._data) {
+      wcscpy(data.m_shipClassName._data, classNameStr);
+      data.m_shipClassName._count = (int32_t)(classLen + 1);
+      data.m_shipClassName._max = (int32_t)(classLen + 1);
+    }
 
     data.m_itemState = EYTechTreeItemState::Owned;
-    data.m_isInFleet = true;
+    data.m_isInFleet = markInFleet;
     data.m_isVeteranStatus = (s->tier >= 5);
     data.m_isHeroShip = false;
     data.m_isFlagship = false;
+
+    uint8_t *raw = (uint8_t *)&data;
+    auto uiIt = g_shipUiStrings.find(s->shipId);
+    if (uiIt != g_shipUiStrings.end()) {
+      if (!uiIt->second.iconPath.empty())
+        InitFStringUE4(raw + UIITEM_ICONPATH, uiIt->second.iconPath.c_str());
+      if (!uiIt->second.categoryImagePath.empty())
+        InitFStringUE4(raw + UIITEM_CATEGORYIMAGEPATH,
+                       uiIt->second.categoryImagePath.c_str());
+      if (!uiIt->second.manufacturerLogoPath.empty())
+        InitFStringUE4(raw + UIITEM_MFGLOGOPATH,
+                       uiIt->second.manufacturerLogoPath.c_str());
+    }
+    ZeroItemPriceData(raw + UIITEM_RESEARCHPRICE);
+    ZeroItemPriceData(raw + UIITEM_PURCHASEPRICE);
 
     int bpClass = s->shipClass;
     if (bpClass == 13) bpClass = 12;
     int key = bpClass * 10 + s->tier;
     auto it = g_loadoutMap.find(key);
-    if (it != g_loadoutMap.end() && it->second < g_numLoadedShips && g_loadedShips[it->second].loadoutObj) {
+    if (it != g_loadoutMap.end() && it->second < g_numLoadedShips &&
+        g_loadedShips[it->second].loadoutObj) {
       data.m_loadoutID = g_loadedShips[it->second].loadoutObj->Name;
     } else {
       data.m_loadoutID = FName("VH_DreadnoughtMedium_T1_PrecastLoadout_BP");
     }
   }
 
-  return pOutArray;
+  tee_printf("[%s] Filled %d ship entries\n", tag, count);
 }
 
-static void* __fastcall hkGetOwnedShipLoadouts(TArray<UYShipLoadoutMmogbrain*>* pOutArray, UUI_OwnedShipsScreen* pThis) {
+// Ships the player owns, in g_FullTechTree order.
+static std::vector<const FTechTreeShip *> CollectOwnedShips() {
+  std::vector<const FTechTreeShip *> owned;
+  for (const auto &s : g_FullTechTree) {
+    if (g_ownedShips.count(s.shipId) > 0)
+      owned.push_back(&s);
+  }
+  return owned;
+}
+
+void __fastcall hkGetOwnedShipDataStructs(UObject* Context, void* Stack, void* RESULT_DECL) {
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigGetOwnedShipDataStructsFunc)
+    ((OrigFunc)OrigGetOwnedShipDataStructsFunc)(Context, Stack, RESULT_DECL);
+
+  if (!RESULT_DECL)
+    return;
+  TArray<FYUIShipManufacturerTechItemData>* pOutArray =
+      (TArray<FYUIShipManufacturerTechItemData>*)RESULT_DECL;
+
   InitFullTechTree();
+
+  // Deliberately NOT deferring to the engine when the string cache is cold.
+  //
+  // That fallback was added as a safety valve and turned out to be the more
+  // dangerous branch: entering Owned Ships without first opening a tech tree
+  // left the cache empty, so the screen received the engine's own two
+  // malformed entries, and clicking one crashed the game. Our list is always
+  // the correct set of owned ships; at worst it renders without artwork until
+  // a tech tree visit warms the cache.
+  if (g_shipUiStrings.empty()) {
+    tee_printf("[OWNED_SHIPS] UI string cache cold - returning owned ships "
+               "without artwork rather than deferring to the engine\n");
+  }
+
+  // The old "|| (s.shipId == 11001 && g_ownedShips.count(61))" special case was
+  // an unexplained magic number and is gone; ownership is just g_ownedShips.
+  std::vector<const FTechTreeShip*> ownedList = CollectOwnedShips();
+
+  if (ownedList.empty()) {
+    for (const auto &s : g_FullTechTree) {
+      if (s.shipId == 11001) {
+        ownedList.push_back(&s);
+        break;
+      }
+    }
+  }
+
+  tee_printf("[OWNED_SHIPS] hkGetOwnedShipDataStructs: Returning %d owned ships "
+             "from profile (engine had %d)\n",
+             (int)ownedList.size(), pOutArray->_count);
+
+  FillShipDataArray(pOutArray, ownedList, /*markInFleet=*/true, "OWNED_SHIPS");
+}
+
+
+// GetOwnedShipLoadouts â€” exec thunk, same correction as above. Registrar
+// FUN_140b057d0 maps "GetOwnedShipLoadouts" to thunk FUN_140bb95e0, whose real
+// body is 0xACBA70.
+void __fastcall hkGetOwnedShipLoadouts(UObject* Context, void* Stack, void* RESULT_DECL) {
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigGetOwnedShipLoadoutsFunc)
+    ((OrigFunc)OrigGetOwnedShipLoadoutsFunc)(Context, Stack, RESULT_DECL);
+
+  // Unconditional entry log: this hook installs but has never appeared in any
+  // runtime log, while GetOwnedShipDataStructs runs normally. The UI therefore
+  // receives 9 ship structs alongside a 0-length loadout array, which is
+  // exactly the "Attempted to access index 0 from array m_loadouts of length
+  // 0" warning seen just before the Owned Ships screen dies. Log on entry so
+  // we can tell "never called" apart from "called and returned early".
+  {
+    static int entryLog = 0;
+    if (entryLog < 20) {
+      tee_printf("[OWNED_SHIPS] hkGetOwnedShipLoadouts ENTERED (result=%p, "
+                 "uiStrings=%d)\n",
+                 RESULT_DECL, (int)g_shipUiStrings.size());
+      entryLog++;
+    }
+  }
+
+  if (!RESULT_DECL)
+    return;
+  TArray<UYShipLoadoutMmogbrain*>* pOutArray =
+      (TArray<UYShipLoadoutMmogbrain*>*)RESULT_DECL;
+
+  InitFullTechTree();
+
+  if (g_shipUiStrings.empty()) {
+    tee_printf("[OWNED_SHIPS] hkGetOwnedShipLoadouts: UI string cache cold, "
+               "still supplying loadouts (engine count=%d)\n",
+               pOutArray->_count);
+  }
 
   std::vector<const FTechTreeShip*> ownedList;
   for (const auto &s : g_FullTechTree) {
@@ -9453,6 +11006,13 @@ static void* __fastcall hkGetOwnedShipLoadouts(TArray<UYShipLoadoutMmogbrain*>* 
   pOutArray->_count = count;
   pOutArray->_max = count;
 
+  // Resolve the fallback loadout once. This used to sit inside the per-ship
+  // loop, so a full GObjects scan (~100k objects, each with a GetFullName()
+  // string build) ran once per owned ship. Nine ships meant nine full scans
+  // before this function could return.
+  UYShipLoadoutMmogbrain *fallbackLoadout = nullptr;
+  bool fallbackResolved = false;
+
   for (int i = 0; i < count; i++) {
     const FTechTreeShip *s = ownedList[i];
     UYShipLoadoutMmogbrain *loadoutObj = nullptr;
@@ -9466,20 +11026,874 @@ static void* __fastcall hkGetOwnedShipLoadouts(TArray<UYShipLoadoutMmogbrain*>* 
     }
 
     if (!loadoutObj) {
-      for (UYShipLoadoutMmogbrain* loadout : UObject::FindObjects<UYShipLoadoutMmogbrain>()) {
-        if (loadout->GetFullName().find("VH_DreadnoughtMedium_T1_PrecastLoadout_BP") != std::string::npos) {
-          loadoutObj = loadout;
-          break;
+      if (!fallbackResolved) {
+        fallbackResolved = true;
+        for (UYShipLoadoutMmogbrain* loadout : UObject::FindObjects<UYShipLoadoutMmogbrain>()) {
+          if (loadout->GetFullName().find("VH_DreadnoughtMedium_T1_PrecastLoadout_BP") != std::string::npos) {
+            fallbackLoadout = loadout;
+            break;
+          }
         }
       }
+      loadoutObj = fallbackLoadout;
     }
 
     pOutArray->_data[i] = loadoutObj;
   }
-
-  return pOutArray;
 }
 
+// ===========================================================================
+// Add Ship To Fleet
+//
+// Blueprint UI_Screen_AddShipToFleet (extracted from custompakchunk0) calls
+// GetAvailableShipsForActiveFleetType to populate the picker and AddShipToFleet
+// when a ship is chosen. Both are UFunctions on UI_AddShipToFleetScreen, both
+// present in GObjects, and the getter returns the same
+// TArray<FYUIShipManufacturerTechItemData> the Owned Ships screen uses.
+//
+// Offline the picker comes back empty (the ship list lived on Mmogbrain) and
+// AddShipToFleet's result never arrives, because UYFleetManager is waiting on
+// HandleMmogbrainAddedToFleet - a server callback that cannot fire. Same shape
+// as the ship purchase, handled the same way.
+// ===========================================================================
+static void *OrigGetAvailableShipsForFleetFunc = nullptr;
+static void *OrigAddShipToFleetFunc = nullptr;
+
+// The shipID the engine itself was asked for, captured from the C++ body rather
+// than inferred. UI_AddShipToFleetScreen.SetSelectedShip never fires on this
+// screen (g_lastClickedSyntheticId stayed 0 across every recorded click), so
+// the previous approach could not identify the ship at all.
+static volatile int32_t g_lastFleetRequestShipId = 0;
+
+// UUI_AddShipToFleetScreen::AddLoadoutToFleet, real C++ body at RVA 0xABF150.
+// Verified by decompile: signature is (UObject* pThis, int32 shipID) with no
+// FFrame anywhere in it, so this is a body and not an exec thunk. It is the
+// function that emits "AddLoadoutToFleet Loadout is NULL" (UI_AddShipToFleet
+// Screen.cpp:0x84) when the loadout lookup comes back empty.
+static void *OrigScreenAddLoadoutToFleet = nullptr;
+void __fastcall MyHookScreenAddLoadoutToFleet(void *pThis, int32_t shipID) {
+  g_lastFleetRequestShipId = shipID;
+  tee_printf("[FLEET] AddLoadoutToFleet requested shipID=%d\n", shipID);
+  typedef void(__fastcall * OrigFunc)(void *, int32_t);
+  if (OrigScreenAddLoadoutToFleet)
+    ((OrigFunc)OrigScreenAddLoadoutToFleet)(pThis, shipID);
+}
+
+// Locate the fleet currently being edited, the same way the engine does.
+// Returns null if anything in the chain is unavailable.
+static uint8_t *FindActiveFleet() {
+  typedef void *(__fastcall * fnGetContextComponent)();
+  typedef void *(__fastcall * fnGetActiveFleetKey)(void *);
+  typedef void *(__fastcall * fnFindFleetByKey)(void *, void *);
+  auto GetContextComponent =
+      (fnGetContextComponent)(Globals::ModuleBase + 0x00AE85E0);
+  auto GetActiveFleetKey =
+      (fnGetActiveFleetKey)(Globals::ModuleBase + 0x00AA1480);
+  auto FindFleetByKey = (fnFindFleetByKey)(Globals::ModuleBase + 0x003463E0);
+
+  if (!g_fleetManagerPtr)
+    return nullptr;
+  void *ctx = GetContextComponent();
+  if (!ctx)
+    return nullptr;
+  void *keyHolder = GetActiveFleetKey(ctx);
+  if (!keyHolder)
+    return nullptr;
+  void *fleet = FindFleetByKey(g_fleetManagerPtr, (uint8_t *)keyHolder + 0x28);
+  if (!fleet || !IsWritableMemory(fleet, 0x50))
+    return nullptr;
+  return (uint8_t *)fleet;
+}
+
+// Is this cache ship ID already in the fleet currently being edited?
+static bool IsShipInActiveFleet(int32_t cacheShipId) {
+  uint8_t *fleet = FindActiveFleet();
+  if (!fleet)
+    return false;
+  int32_t *ids = *(int32_t **)(fleet + 0x00);
+  int32_t num = *(int32_t *)(fleet + 0x08);
+  if (!ids || num <= 0 ||
+      !IsWritableMemory(ids, (size_t)num * sizeof(int32_t)))
+    return false;
+  for (int32_t i = 0; i < num; i++)
+    if (ids[i] == cacheShipId)
+      return true;
+  return false;
+}
+
+// Append a ship to the active fleet's membership array in place.
+//
+// This is the local half of what HandleMmogbrainAddedToFleet would normally do
+// when the server acknowledged the add. Capacity was reserved at fleet creation
+// so no reallocation happens here.
+static bool AppendShipToActiveFleet(int32_t cacheShipId) {
+  uint8_t *fleet = FindActiveFleet();
+  if (!fleet) {
+    tee_printf("[FLEET] Could not resolve the active fleet; not appending\n");
+    return false;
+  }
+
+  int32_t *ids = *(int32_t **)(fleet + 0x00);
+  int32_t num = *(int32_t *)(fleet + 0x08);
+  int32_t max = *(int32_t *)(fleet + 0x0C);
+  if (!ids || !IsWritableMemory(ids, (size_t)max * sizeof(int32_t))) {
+    tee_printf("[FLEET] Fleet membership array is not writable; not appending\n");
+    return false;
+  }
+
+  for (int32_t i = 0; i < num; i++) {
+    if (ids[i] == cacheShipId) {
+      tee_printf("[FLEET] Ship %d already in the engine's fleet list\n",
+                 cacheShipId);
+      return false;
+    }
+  }
+  if (num >= max) {
+    tee_printf("[FLEET] Engine fleet list full (%d/%d)\n", num, max);
+    return false;
+  }
+
+  ids[num] = cacheShipId;
+  *(int32_t *)(fleet + 0x08) = num + 1;
+
+  // Keep the parallel veteran-status array's length in step, or the two
+  // disagree and anything zipping them walks off the end.
+  bool *vets = *(bool **)(fleet + 0x10);
+  int32_t vetMax = *(int32_t *)(fleet + 0x1C);
+  if (vets && num < vetMax && IsWritableMemory(vets, (size_t)vetMax)) {
+    vets[num] = false;
+    *(int32_t *)(fleet + 0x18) = num + 1;
+  }
+
+  tee_printf("[FLEET] Appended ship %d to the engine fleet list (%d/%d)\n",
+             cacheShipId, num + 1, max);
+  return true;
+}
+
+// Screen-level remove path, hooked purely to locate where it gives up.
+//
+// HandleRemoveFromFleetAction fires (confirmed in the trace) but the fleet
+// manager's RemoveLoadoutFromFleet at 0x359B50 is never reached, so
+// UUI_ManageFleetScreen::RemoveShipFromFleet is bailing somewhere in between.
+// There are no log strings in UI_ManageFleetScreen.cpp to anchor a Ghidra
+// search on, so these two by-name hooks establish the facts instead: whether
+// the screen function is entered at all, and whether the screen ever learns
+// which ship the context menu is acting on.
+static void *OrigScreenRemoveShipFromFleet = nullptr;
+void __fastcall MyHookScreenRemoveShipFromFleet(UObject *Context, void *Stack,
+                                                void *RESULT_DECL) {
+  tee_printf("[FLEET] UI_ManageFleetScreen::RemoveShipFromFleet entered\n");
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigScreenRemoveShipFromFleet)
+    ((OrigFunc)OrigScreenRemoveShipFromFleet)(Context, Stack, RESULT_DECL);
+  tee_printf("[FLEET] UI_ManageFleetScreen::RemoveShipFromFleet returned\n");
+}
+
+static void *OrigScreenSetCurrentShipId = nullptr;
+void __fastcall MyHookScreenSetCurrentShipId(UObject *Context, void *Stack,
+                                             void *RESULT_DECL) {
+  tee_printf("[FLEET] UI_ManageFleetScreen::SetCurrentShipId called\n");
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigScreenSetCurrentShipId)
+    ((OrigFunc)OrigScreenSetCurrentShipId)(Context, Stack, RESULT_DECL);
+}
+
+// UUI_ManageFleetScreen::RemoveShipFromFleet, real body at RVA 0xADBBA0,
+// reached from the exec thunk at 0xBC0A30 (verified: the thunk reads one int,
+// does P_FINISH, then tail-calls this). Signature (UObject* pThis, int32
+// shipID).
+//
+// Hooked here rather than by name because the by-name hook on the UFunction
+// never fired even though the body demonstrably ran - the callees inside it
+// (GetFleetShipCount, FindLoadoutsForShip) logged. Whatever indirection the
+// Blueprint uses to reach it bypasses UFunction::Func, so the body is the only
+// reliable place to observe the parameter.
+static void *OrigScreenRemoveShipBody = nullptr;
+void __fastcall MyHookScreenRemoveShipBody(void *pThis, int32_t shipID) {
+  tee_printf("[FLEET] RemoveShipFromFleet body: shipID=%d\n", shipID);
+  typedef void(__fastcall * OrigFunc)(void *, int32_t);
+  if (OrigScreenRemoveShipBody)
+    ((OrigFunc)OrigScreenRemoveShipBody)(pThis, shipID);
+  tee_printf("[FLEET] RemoveShipFromFleet body done\n");
+}
+
+// Shared synthetic -> loadout-entry-key translation. See
+// MyHookGetLoadoutForShipID for why this exists.
+static int32_t TranslateToLoadoutKey(int32_t shipID) {
+  if (shipID >= 11000 && shipID <= 19999) {
+    auto it = g_syntheticToLoadoutKey.find(shipID);
+    if (it != g_syntheticToLoadoutKey.end())
+      return it->second;
+  }
+  return shipID;
+}
+
+// UYLoadoutManagerComponent loadout lookup, real body at RVA 0x33FED0.
+//
+// A *second* lookup with the same shape as 0x340950 - walks m_loadoutEntries
+// and matches *(int*)(entry + 0x20) - but returning bool. The remove path uses
+// this one rather than 0x340950, so translating only 0x340950 left removal
+// looking up synthetic IDs against a table keyed by cache IDs.
+static void *OrigFindLoadoutsForShip = nullptr;
+uint64_t __fastcall MyHookFindLoadoutsForShip(void *lmc, int32_t shipID,
+                                              void *outLoadouts) {
+  int32_t effectiveID = TranslateToLoadoutKey(shipID);
+  typedef uint64_t(__fastcall * OrigFunc)(void *, int32_t, void *);
+  uint64_t found = 0;
+  if (OrigFindLoadoutsForShip)
+    found = ((OrigFunc)OrigFindLoadoutsForShip)(lmc, effectiveID, outLoadouts);
+  // The caller ignores the bool and loops over the out array, so the count is
+  // what actually decides whether anything happens. out = { void* data; int32
+  // count; int32 max }.
+  int32_t outCount = -1;
+  void *outData = nullptr;
+  if (outLoadouts && IsWritableMemory(outLoadouts, 12)) {
+    outData = *(void **)outLoadouts;
+    outCount = *(int32_t *)((uint8_t *)outLoadouts + 8);
+  }
+  tee_printf("[LOADOUTFIND] shipID=%d key=%d found=%d outCount=%d data=%p\n",
+             shipID, effectiveID, (int)(found & 0xFF), outCount, outData);
+  return found;
+}
+
+// UYFleetManager fleet ship count, real body at RVA 0x3467F0, signature
+// (this, FName* fleetKey) -> int.
+//
+// This is the gate on removal: UUI_ManageFleetScreen::RemoveShipFromFleet
+// (0xADBBA0) refuses with "You cannot remove the last ship belonging to this
+// fleet" whenever this returns < 2. Offline that refusal is *silent*, because
+// the popup is only shown when the screen's dialog manager (FUN_140AECC30) is
+// non-null. Log the engine's answer next to the fleet's own membership count so
+// the two can be compared rather than assumed equal.
+static void *OrigGetFleetShipCount = nullptr;
+int32_t __fastcall MyHookGetFleetShipCount(void *fleetMgr, void *fleetKey) {
+  typedef int32_t(__fastcall * OrigFunc)(void *, void *);
+  int32_t engineCount = 0;
+  if (OrigGetFleetShipCount)
+    engineCount = ((OrigFunc)OrigGetFleetShipCount)(fleetMgr, fleetKey);
+
+  int32_t rawCount = -1;
+  typedef void *(__fastcall * fnFindFleetByKey)(void *, void *);
+  auto FindFleetByKey = (fnFindFleetByKey)(Globals::ModuleBase + 0x003463E0);
+  if (fleetMgr && fleetKey) {
+    uint8_t *fleet = (uint8_t *)FindFleetByKey(fleetMgr, fleetKey);
+    if (fleet && IsWritableMemory(fleet, 0x50))
+      rawCount = *(int32_t *)(fleet + 0x08);
+  }
+
+  tee_printf("[FLEETCOUNT] engine=%d fleetArray=%d\n", engineCount, rawCount);
+  return engineCount;
+}
+
+// UYFleetManager::RemoveLoadoutFromFleet, real body at RVA 0x359B50.
+// Signature (this, FName* fleetKey, FName* loadoutName) - verified by decompile,
+// no FFrame. Mirrors AddLoadoutToFleet exactly: it locates the ship in the
+// fleet's TArray<int32> at fleet+0x00, then hands off to Mmogbrain
+// (FUN_142A40150) and returns *without removing anything locally*, so offline
+// "Remove from fleet" fired and did nothing. The local half is done here.
+static void *OrigRemoveLoadoutFromFleet = nullptr;
+uint64_t __fastcall MyHookRemoveLoadoutFromFleet(void *fleetMgr,
+                                                 void *fleetKey,
+                                                 void *loadoutName) {
+  typedef uint64_t(__fastcall * OrigFunc)(void *, void *, void *);
+  uint64_t ret = 0;
+  if (OrigRemoveLoadoutFromFleet)
+    ret = ((OrigFunc)OrigRemoveLoadoutFromFleet)(fleetMgr, fleetKey,
+                                                 loadoutName);
+  tee_printf("[FLEET] RemoveLoadoutFromFleet hook entered (mgr=%p key=%p "
+             "name=%p)\n",
+             fleetMgr, fleetKey, loadoutName);
+
+  if (!fleetMgr || !fleetKey || !loadoutName) {
+    tee_printf("[FLEET] Remove: null argument, bailing\n");
+    return ret;
+  }
+
+  typedef void *(__fastcall * fnFindFleetByKey)(void *, void *);
+  typedef void *(__fastcall * fnFindLoadoutByID)(void *, void *, char);
+  auto FindFleetByKey = (fnFindFleetByKey)(Globals::ModuleBase + 0x003463E0);
+  auto FindLoadoutByID = (fnFindLoadoutByID)(Globals::ModuleBase + 0x00340340);
+
+  uint8_t *fleet = (uint8_t *)FindFleetByKey(fleetMgr, fleetKey);
+  if (!fleet || !IsWritableMemory(fleet, 0x50)) {
+    tee_printf("[FLEET] Remove: could not resolve fleet\n");
+    return ret;
+  }
+
+  // The loadout manager lives at fleetMgr+0x28 - the same pointer the engine
+  // passes to FindLoadoutByID on the line above the Mmogbrain call.
+  void *lmc = *(void **)((uint8_t *)fleetMgr + 0x28);
+  if (!lmc) {
+    tee_printf("[FLEET] Remove: loadout manager null, bailing\n");
+    return ret;
+  }
+  void *loadout = FindLoadoutByID(lmc, loadoutName, 1);
+  if (!loadout) {
+    tee_printf("[FLEET] Remove: loadout not found\n");
+    return ret;
+  }
+
+  // vtable+0x1E8 is the ship-ID getter; both AddLoadoutToFleet and the
+  // eligibility check call exactly this slot to key into fleet+0x00.
+  int32_t shipId = 0;
+  {
+    // Vtables are read-only; see IsReadableMemory.
+    void **vt = *(void ***)loadout;
+    if (!vt || !IsReadableMemory(vt, 0x1F0)) {
+      tee_printf("[FLEET] Remove: loadout vtable unreadable (vt=%p), bailing\n",
+                 (void *)vt);
+      return ret;
+    }
+    typedef int32_t(__fastcall * fnGetShipID)(void *);
+    auto GetShipID = (fnGetShipID)vt[0x1E8 / 8];
+    if (!GetShipID) {
+      tee_printf("[FLEET] Remove: GetShipID slot empty, bailing\n");
+      return ret;
+    }
+    shipId = GetShipID(loadout);
+  }
+
+  int32_t *ids = *(int32_t **)(fleet + 0x00);
+  int32_t num = *(int32_t *)(fleet + 0x08);
+  int32_t max = *(int32_t *)(fleet + 0x0C);
+  uint8_t fleetType = *(uint8_t *)(fleet + 0x40);
+  if (!ids || num <= 0 ||
+      !IsWritableMemory(ids, (size_t)max * sizeof(int32_t))) {
+    tee_printf("[FLEET] Remove: membership array unusable (ids=%p num=%d "
+               "max=%d), bailing\n",
+               (void *)ids, num, max);
+    return ret;
+  }
+
+  // Preserve the engine's own rule rather than overriding it: a Recruit fleet
+  // (type 1) may not be emptied. Same test as YFleetManager.cpp:0x514.
+  if (fleetType == 1 && num <= 1) {
+    tee_printf("[FLEET] Remove refused: Recruit fleet must keep at least one "
+               "ship\n");
+    return ret;
+  }
+
+  int32_t found = -1;
+  for (int32_t i = 0; i < num; i++) {
+    if (ids[i] == shipId) {
+      found = i;
+      break;
+    }
+  }
+  if (found < 0) {
+    tee_printf("[FLEET] Remove: ship %d not in this fleet\n", shipId);
+    return ret;
+  }
+
+  for (int32_t i = found; i < num - 1; i++)
+    ids[i] = ids[i + 1];
+  ids[num - 1] = 0;
+  *(int32_t *)(fleet + 0x08) = num - 1;
+
+  // Keep the parallel veteran-status array in step, same as on append.
+  bool *vets = *(bool **)(fleet + 0x10);
+  int32_t vetNum = *(int32_t *)(fleet + 0x18);
+  int32_t vetMax = *(int32_t *)(fleet + 0x1C);
+  if (vets && vetNum == num && IsWritableMemory(vets, (size_t)vetMax)) {
+    for (int32_t i = found; i < num - 1; i++)
+      vets[i] = vets[i + 1];
+    *(int32_t *)(fleet + 0x18) = num - 1;
+  }
+
+  // Mirror into the save file. g_fleetSlots stores synthetic IDs, so map back.
+  for (auto it = g_syntheticToLoadoutKey.begin();
+       it != g_syntheticToLoadoutKey.end(); ++it) {
+    if (it->second != shipId)
+      continue;
+    for (size_t i = 0; i < g_fleetSlots.size(); i++) {
+      if (g_fleetSlots[i] == it->first) {
+        g_fleetSlots.erase(g_fleetSlots.begin() + i);
+        SaveFleetData();
+        break;
+      }
+    }
+    break;
+  }
+
+  tee_printf("[FLEET] Removed ship %d from fleet (now %d/%d)\n", shipId,
+             num - 1, max);
+
+  // Tell the screen to rebuild.
+  //
+  // Nothing in this game refreshes itself: every list is rebuilt in response to
+  // a Mmogbrain reply, never off the local data changing. Here the awaited
+  // reply is UI_ManageFleetScreen::OnLoadoutRemovedFromFleet(bool), the exact
+  // analogue of HandlePurchaseCompleted(true) on the purchase panel. Without it
+  // the fleet is genuinely modified but the widget keeps painting its old
+  // state, which is why leaving and re-entering the screen "fixes" it - that
+  // forces a fresh Construct and a re-query.
+  ProcInMainThread([]() {
+    UFunction *fn = (UFunction *)GetObjByName(
+        "Function DreadGameUI.UI_ManageFleetScreen.OnLoadoutRemovedFromFleet");
+    if (!fn) {
+      tee_printf("[FLEET] OnLoadoutRemovedFromFleet UFunction not found\n");
+      return;
+    }
+    UObject *screen = nullptr;
+    for (UObject *s : UObject::FindObjects<UObject>()) {
+      if (!s)
+        continue;
+      std::string full = s->GetFullName();
+      if (full.find("UI_Screen_ManageFleet_C ") == std::string::npos)
+        continue;
+      if (full.find("Default__") != std::string::npos)
+        continue;
+      screen = s;
+    }
+    if (!screen) {
+      tee_printf("[FLEET] No live ManageFleet screen to notify\n");
+      return;
+    }
+    struct {
+      bool Result;
+    } params = {true};
+    if (pProcessEvent_Original)
+      pProcessEvent_Original(screen, fn, &params);
+
+    // OnLoadoutRemovedFromFleet alone leaves the tiles stale, the same way
+    // HandlePurchaseCompleted alone left the CLAIM button stale - the specific
+    // handler acknowledges the event without rebuilding anything.
+    // OnFleetUpdated is the broad "the fleet changed, repopulate" signal and is
+    // the ManageFleet analogue of the purchase panel's Setup.
+    //
+    // Adding a ship already refreshes correctly only because it navigates back
+    // to this screen, forcing a fresh Construct. Removal happens in place, so
+    // nothing rebuilds it.
+    UFunction *updatedFn = (UFunction *)GetObjByName(
+        "Function DreadGameUI.UI_ManageFleetScreen.OnFleetUpdated");
+    if (updatedFn && pProcessEvent_Original)
+      pProcessEvent_Original(screen, updatedFn, nullptr);
+
+    tee_printf("[FLEET] Notified %s OnLoadoutRemovedFromFleet(true) "
+               "OnFleetUpdated=%s\n",
+               screen->GetName().c_str(), updatedFn ? "yes" : "MISSING");
+  });
+  return ret;
+}
+
+// AYMenu::StartMatchmaking, real body at RVA 0x4D18D0.
+//
+// Reached from the exec thunk at 0x77FCF0, which pulls (EYGameModeType,
+// FString fullMapPath) off the FFrame. The engine's path from here is
+// 0x4D18D0 -> resolve the mode definition -> AYMenu::FindAMatch (0x4AD6E0),
+// and FindAMatch ends in a Mmogbrain RPC that offline can never be answered.
+// That is why PLAY consumed the button and played the queue audio sting but no
+// timer ever appeared: the request went out and nothing came back.
+//
+// The map is an explicit parameter rather than something the server chooses,
+// so offline we already have everything needed to just go there. Travel
+// directly and skip the round trip.
+//
+// Deliberately NOT reproducing gwog's launcher: its map travel was fine, but
+// it also kicked off a detached post-launch setup thread that faulted in a
+// loop walking a null-based structure. Travel only here.
+static void *OrigYMenuStartMatchmaking = nullptr;
+static const wchar_t *kDefaultMatchMap = L"/Game/Maps/MP/Amirani/MP_Amirani_P";
+
+// Shared local-launch. `path` may be empty, in which case the default map is
+// used - most entry points do not hand us one.
+//
+// Guarded so that two entry points firing for a single click (or a queue that
+// retries) cannot issue two travels.
+static bool g_matchTravelIssued = false;
+
+static void TravelToMatchMap(const std::wstring &pathIn, const wchar_t *why) {
+  std::wstring path = pathIn;
+
+  // "ANY" is the placeholder the mode list carries when no specific map was
+  // picked - it is entry [0] of the authored map table, not a real level.
+  if (path.empty() || path == L"ANY" || path == L"None")
+    path = kDefaultMatchMap;
+
+  if (g_matchTravelIssued) {
+    tee_printf("[MATCH] %ls fired, but a travel is already in flight.\n", why);
+    return;
+  }
+  g_matchTravelIssued = true;
+
+  // ?Listen so the travel stands up a listen server locally; without it the
+  // client has nothing to connect to and bounces straight back.
+  std::wstring url = path + L"?Listen";
+  tee_printf("[MATCH] %ls -> traveling to '%ls'\n", why, url.c_str());
+
+  ProcInMainThread([url]() {
+    if (!UWorld::GWorld || !*UWorld::GWorld) {
+      tee_printf("[MATCH] GWorld is null - cannot travel.\n");
+      g_matchTravelIssued = false;
+      return;
+    }
+    FString travelUrl = url.c_str();
+    reinterpret_cast<void (*)(UWorld *, FString *, bool, bool)>(
+        Globals::ModuleBase + 0x1CE2E40)((*UWorld::GWorld), &travelUrl, true,
+                                         false);
+    tee_printf("[MATCH] ServerTravel issued.\n");
+  });
+}
+
+void __fastcall MyHookYMenuStartMatchmaking(void *pThis, uint32_t gameModeType,
+                                            void *fullMapPath) {
+  std::wstring path = fullMapPath ? ReadFStringUE4(fullMapPath) : L"";
+
+  tee_printf("[MATCH] StartMatchmaking: mode=%u map='%ls'\n", gameModeType,
+             path.c_str());
+
+  // "ANY" is the placeholder the mode list carries when no specific map was
+  // picked - it is entry [0] of the authored map table, not a real level.
+  if (path.empty() || path == L"ANY" || path == L"None") {
+    tee_printf("[MATCH] No usable map path, defaulting to %ls\n",
+               kDefaultMatchMap);
+    path = kDefaultMatchMap;
+  }
+
+  TravelToMatchMap(path, L"AYMenu::StartMatchmaking");
+
+  // The original is not called on purpose. It would queue a Mmogbrain request
+  // that cannot complete, and leave the menu believing it is in a queue.
+}
+
+// The Blueprint-facing matchmaking entry points.
+//
+// The MinHook on AYMenu::StartMatchmaking (0x4D18D0) never fired, and the
+// ProcessEvent tracer never saw any StartMatchmaking call either - yet the
+// queue is definitely entered: UI_Screen_ManageFleet_C.OnMatchmakingStarted
+// fires, UI_Screen_Persistent_C.OnMatchmakingTimerStarted fires, the timer
+// widget constructs, and the Quickplay button is gone afterwards because a
+// queue is live.
+//
+// Both blind spots have one cause. Blueprint invokes final native functions
+// through EX_FinalFunction, which calls UFunction::Func directly and never
+// routes through ProcessEvent. So a ProcessEvent tracer cannot see the call at
+// all, and the address I had picked was simply the wrong one of several
+// StartMatchmaking overloads.
+//
+// Hooking by name swaps UFunction::Func itself - the very pointer the VM
+// calls - so it catches the call however it is dispatched.
+//
+// The original runs FIRST, deliberately: it performs P_FINISH on the FFrame
+// and consumes the declared parameters, keeping the bytecode stream intact.
+// Skipping it would corrupt the VM (see the exec-thunk trap that has bitten
+// this codebase before). Its Mmogbrain request goes unanswered exactly as it
+// already does today, which costs nothing, and then we travel locally.
+static void *OrigMmInterpStartMatchmaking = nullptr;
+static void *OrigPersistentStartMatchmaking = nullptr;
+static void *OrigMmInterpStartQuickPlay = nullptr;
+
+void __fastcall MyHookMmInterpStartMatchmaking(UObject *Context, void *Stack,
+                                               void *RESULT_DECL) {
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigMmInterpStartMatchmaking)
+    ((OrigFunc)OrigMmInterpStartMatchmaking)(Context, Stack, RESULT_DECL);
+  TravelToMatchMap(L"", L"YMatchmakingInterpreter::StartMatchmaking");
+}
+
+void __fastcall MyHookPersistentStartMatchmaking(UObject *Context, void *Stack,
+                                                 void *RESULT_DECL) {
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigPersistentStartMatchmaking)
+    ((OrigFunc)OrigPersistentStartMatchmaking)(Context, Stack, RESULT_DECL);
+  TravelToMatchMap(L"", L"UI_PersistentScreen::StartMatchmaking");
+}
+
+void __fastcall MyHookMmInterpStartQuickPlay(UObject *Context, void *Stack,
+                                             void *RESULT_DECL) {
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigMmInterpStartQuickPlay)
+    ((OrigFunc)OrigMmInterpStartQuickPlay)(Context, Stack, RESULT_DECL);
+  TravelToMatchMap(L"", L"YMatchmakingInterpreter::StartQuickPlayMatchmaking");
+}
+
+// The loadout-item-type classifier, RVA 0x541CD0. Everything that filters tech
+// tree items by slot runs through it.
+//
+// It resolves a type in two stages. First FindCachedDataEntry(itemID), and on a
+// hit it returns m_loadoutItemType straight from the item cache. On a miss it
+// falls back to looking the ID up as an item *definition* object and deriving
+// the type from the class: weapon classes return 1 or 2 depending on a flag at
+// +0x5DC, ability classes map a byte at +0x30 to 3..6, officer classes map +0x60
+// to 7..10, appearance classes map to 11..18. If that lookup also fails it
+// returns 0.
+//
+// Offline it returns 0 for every weapon and module. The item cache holds 3086
+// entries but only covers officers and similar; the ships' actual weapons and
+// abilities (the 0x040F/0x050F ranges) are absent, and the definition-object
+// registry behind the fallback is empty too. Type 0 fails the `type - 2 < 5`
+// test in 0xAA9570, which is the real reason the tech tree read 0/0 even once
+// the per-ship table was populated and returning 10-18 modules.
+//
+// The authored answer is already on hand. Each FYRelatedItemEntry carries an
+// m_identifier alongside its m_itemID, and that identifier IS the
+// EYUILoadoutItemType: across every related item in the cache where both values
+// are known, they agree 20/20 with no mismatches (officers 7/8/9/10 land on
+// exactly 7/8/9/10), and the identifier sequence 1..18 lines up one-to-one with
+// the enum - WEAPON_FIRST=1 through APPEARANCE_STERN=18 - and with the ordering
+// the class-based fallback itself produces.
+//
+// So substitute the authored identifier, and only when the engine gave up.
+// A real answer always wins; this only fills in the zeroes.
+static void *OrigClassifyLoadoutItemType = nullptr;
+char __fastcall MyHookClassifyLoadoutItemType(uint64_t itemID) {
+  typedef char(__fastcall * OrigFunc)(uint64_t);
+  char engineType = 0;
+  if (OrigClassifyLoadoutItemType)
+    engineType = ((OrigFunc)OrigClassifyLoadoutItemType)(itemID);
+
+  auto it = g_moduleItemIds.find((int32_t)itemID);
+  bool known = (it != g_moduleItemIds.end());
+  char authored = known ? (char)it->second : (char)-1;
+
+  // Prefer the authored identifier whenever we have one. Not just when the
+  // engine returns 0: with the item cache missing every weapon and ability,
+  // the engine's answer for exactly these items is the least trustworthy one
+  // it gives. Where both are genuinely available - the officer items that do
+  // live in the cache - they agree 20/20, so preferring the authored value
+  // costs nothing and never contradicts a real lookup.
+  char type = engineType;
+  if (known && it->second >= 1 && it->second <= 18)
+    type = (char)it->second;
+
+  // Log unconditionally for the first N calls. A hook that never fires and a
+  // hook that had nothing to substitute look identical otherwise, and that is
+  // exactly the ambiguity to resolve here.
+  static int logCount = 0;
+  if (logCount < 40) {
+    tee_printf("[TECHTREE] Classify(0x%08X) engine=%d authored=%d -> %d%s\n",
+               (uint32_t)itemID, (int)engineType, (int)authored, (int)type,
+               (type >= 2 && type <= 6) ? " [COUNTS]" : "");
+    logCount++;
+  }
+  return type;
+}
+
+// UYTechTreeManager::FindShipTechTreeData, RVA 0x3F5050 - the single choke
+// point every per-ship tech tree query passes through. See PopulateShipTechTrees
+// for the table it scans.
+//
+// Two jobs here. First, log what the UI actually asks for: the tech tree
+// screens could plausibly query synthetic IDs (11001+), real cache IDs
+// (0x01FF0xxx) or loadout entry keys, and which one it is decides whether the
+// table we built is even reachable. Second, retry a miss under the other ID
+// dialect, the same trick that fixed GetLoadoutForShipID.
+static void *OrigFindShipTechTreeData = nullptr;
+char __fastcall MyHookFindShipTechTreeData(void *ttm, int32_t itemID,
+                                           void *out) {
+  typedef char(__fastcall * OrigFunc)(void *, int32_t, void *);
+  char found = 0;
+  if (OrigFindShipTechTreeData)
+    found = ((OrigFunc)OrigFindShipTechTreeData)(ttm, itemID, out);
+
+  int32_t retriedWith = 0;
+  if (!found && OrigFindShipTechTreeData) {
+    int32_t alt = 0;
+    if (itemID >= 11000 && itemID <= 19999) {
+      auto it = g_syntheticToRealMap.find(itemID);
+      if (it != g_syntheticToRealMap.end())
+        alt = it->second;
+    } else {
+      auto it = g_realToSyntheticMap.find(itemID);
+      if (it != g_realToSyntheticMap.end())
+        alt = it->second;
+    }
+    if (alt != 0 && alt != itemID) {
+      found = ((OrigFunc)OrigFindShipTechTreeData)(ttm, alt, out);
+      if (found)
+        retriedWith = alt;
+    }
+  }
+
+  static int logCount = 0;
+  if (logCount < 60) {
+    // Count is at out+0x10 - the modules TArray the consumers actually read.
+    int32_t modCount = 0;
+    if (found && out && IsReadableMemory((uint8_t *)out + 0x10, 4))
+      modCount = *(int32_t *)((uint8_t *)out + 0x10);
+    // Caller RVA distinguishes the consumers, which otherwise look identical
+    // in the log: 0xAA9570 is the progression denominator, 0xAA7E40 the
+    // owned/precast split, 0xA989A0 ComposeModuleUiDataForShip (the list the
+    // tech tree screen renders), 0x4EE820 GetShipResearchData, 0xAA88F0 the
+    // research XP total. Which of them fire tells us whether the screen is
+    // even asking.
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t callerRva =
+        caller > (uintptr_t)Globals::ModuleBase
+            ? caller - (uintptr_t)Globals::ModuleBase
+            : 0;
+    tee_printf("[TECHTREE] FindShipTechTreeData(%d / 0x%08X) -> %s%s "
+               "modules=%d caller=0x%llX\n",
+               itemID, (uint32_t)itemID, found ? "HIT" : "MISS",
+               retriedWith ? " (via retry)" : "", modCount,
+               (unsigned long long)callerRva);
+    logCount++;
+  }
+  return found;
+}
+
+// UYLoadoutManagerComponent::GetLoadoutForShipID, real body at RVA 0x340950.
+// Walks m_loadoutEntries (data at this+0x108, count at this+0x110, stride 0x30)
+// and matches *(int*)(entry + 0x20) against shipID. No match means the out
+// parameter is left untouched, which is precisely how "Loadout is NULL" arises.
+// Logging both sides here shows whether the UI's ID space and the loadout
+// manager's ID space overlap at all.
+static void *OrigGetLoadoutForShipID = nullptr;
+void __fastcall MyHookGetLoadoutForShipID(void *lmc, int32_t shipID,
+                                          void *outLoadouts) {
+  // Translate synthetic -> loadout key before the engine scans. This is the
+  // single choke point for every "which loadout is this ship" question in the
+  // game, so fixing it here fixes the fleet screens, the loadout screens and
+  // anything else that asks, rather than patching each caller.
+  int32_t effectiveID = shipID;
+  if (shipID >= 11000 && shipID <= 19999) {
+    auto it = g_syntheticToLoadoutKey.find(shipID);
+    if (it != g_syntheticToLoadoutKey.end())
+      effectiveID = it->second;
+  }
+
+  typedef void(__fastcall * OrigFunc)(void *, int32_t, void *);
+  if (OrigGetLoadoutForShipID)
+    ((OrigFunc)OrigGetLoadoutForShipID)(lmc, effectiveID, outLoadouts);
+
+  // out parameter is { void* data; int32 count; ... } on the caller's stack.
+  int32_t outCount = -1;
+  if (outLoadouts && IsWritableMemory(outLoadouts, 12))
+    outCount = *(int32_t *)((uint8_t *)outLoadouts + 8);
+
+  int32_t entryCount = 0;
+  if (lmc && IsWritableMemory((uint8_t *)lmc + 0x108, 12))
+    entryCount = *(int32_t *)((uint8_t *)lmc + 0x110);
+
+  if (effectiveID != shipID)
+    tee_printf("[LOADOUTLOOKUP] shipID=%d -> key %d -> %d loadout(s) (manager "
+               "holds %d entries)\n",
+               shipID, effectiveID, outCount, entryCount);
+  else
+    tee_printf("[LOADOUTLOOKUP] shipID=%d -> %d loadout(s) (manager holds %d "
+               "entries, no translation)\n",
+               shipID, outCount, entryCount);
+}
+
+void __fastcall MyHookGetAvailableShipsForActiveFleetType(UObject *Context,
+                                                          void *Stack,
+                                                          void *RESULT_DECL) {
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigGetAvailableShipsForFleetFunc)
+    ((OrigFunc)OrigGetAvailableShipsForFleetFunc)(Context, Stack, RESULT_DECL);
+
+  tee_printf("[FLEET] picker hook entered (ctx=%p result=%p)\n", (void *)Context,
+             RESULT_DECL);
+  if (!RESULT_DECL) {
+    tee_printf("[FLEET] picker: RESULT_DECL null, cannot populate\n");
+    return;
+  }
+
+  InitFullTechTree();
+
+  // Which fleet is being edited? Resolved the same way the engine does it in
+  // UUI_AddShipToFleetScreen::AddLoadoutToFleet: context component ->
+  // active fleet key -> fleet lookup, then read the type byte at fleet+0x40.
+  // Reproducing the engine's own path avoids inventing a second notion of
+  // "active fleet" that could disagree with the one enforcing eligibility.
+  int minTier = 0, maxTier = 99;
+  uint8_t activeFleetType = 0xFF;
+  if (uint8_t *fleet = FindActiveFleet()) {
+    activeFleetType = *(uint8_t *)(fleet + 0x40);
+    for (int i = 0; i < g_numFleetTierRanges; i++) {
+      if (g_fleetTierRanges[i].fleetType == activeFleetType) {
+        minTier = g_fleetTierRanges[i].minTier;
+        maxTier = g_fleetTierRanges[i].maxTier;
+        break;
+      }
+    }
+  }
+
+  // Offer owned ships that are not already in the fleet and that the fleet
+  // would actually accept. Without the tier test a Recruit fleet (tiers 1-2)
+  // listed tier 3+ ships that AddLoadoutToFleet then rejects as ineligible.
+  // Membership is tested against the engine's own list rather than
+  // g_fleetSlots - see MyHookAddShipToFleet for why that global cannot be
+  // trusted for this.
+  std::vector<const FTechTreeShip *> available;
+  int rejectedByTier = 0, alreadyInFleetCount = 0;
+  for (const FTechTreeShip *s : CollectOwnedShips()) {
+    auto keyIt = g_syntheticToLoadoutKey.find(s->shipId);
+    if (keyIt != g_syntheticToLoadoutKey.end() &&
+        IsShipInActiveFleet(keyIt->second)) {
+      alreadyInFleetCount++;
+      continue;
+    }
+    if (s->tier < minTier || s->tier > maxTier) {
+      rejectedByTier++;
+      continue;
+    }
+    available.push_back(s);
+  }
+
+  tee_printf("[FLEET] GetAvailableShipsForActiveFleetType: fleetType=%d tiers "
+             "%d-%d | %d owned, %d offered, %d wrong tier, %d already in fleet "
+             "(engine offered %d)\n",
+             (int)activeFleetType, minTier, maxTier, (int)g_ownedShips.size(),
+             (int)available.size(), rejectedByTier, alreadyInFleetCount,
+             ((TArray<FYUIShipManufacturerTechItemData> *)RESULT_DECL)->_count);
+
+  FillShipDataArray((TArray<FYUIShipManufacturerTechItemData> *)RESULT_DECL,
+                    available, /*markInFleet=*/false, "FLEET");
+}
+
+void __fastcall MyHookAddShipToFleet(UObject *Context, void *Stack,
+                                     void *RESULT_DECL) {
+  // Clear first: the original calls UUI_AddShipToFleetScreen::AddLoadoutToFleet
+  // internally, and MyHookScreenAddLoadoutToFleet records the real shipID there.
+  // Reading it afterwards is what identifies the ship. The earlier version
+  // relied on g_lastClickedSyntheticId, which SetSelectedShip never populates on
+  // this screen - every logged click reported lastClicked=0.
+  g_lastFleetRequestShipId = 0;
+
+  typedef void(__fastcall * OrigFunc)(UObject *, void *, void *);
+  if (OrigAddShipToFleetFunc)
+    ((OrigFunc)OrigAddShipToFleetFunc)(Context, Stack, RESULT_DECL);
+
+  int32_t requested = g_lastFleetRequestShipId;
+  int32_t synth = ResolveToSyntheticShipId(requested);
+  if (synth <= 0) {
+    tee_printf("[FLEET] AddShipToFleet fired but no ship resolved "
+               "(engine requested shipID=%d)\n",
+               requested);
+    return;
+  }
+
+  if (g_ownedShips.count(synth) == 0) {
+    tee_printf("[FLEET] AddShipToFleet: ship %d is not owned, ignoring\n", synth);
+    return;
+  }
+
+  auto keyIt = g_syntheticToLoadoutKey.find(synth);
+  if (keyIt == g_syntheticToLoadoutKey.end()) {
+    tee_printf("[FLEET] No loadout key for synthetic %d; cannot add\n", synth);
+    return;
+  }
+
+  // The engine's per-fleet list is the source of truth for membership and the
+  // 5-ship limit. g_fleetSlots deliberately is not: it is a single flat list
+  // shared across all three fleets, and it ships pre-seeded with a fabricated
+  // default, so gating on it rejected every add as "fleet full" before any of
+  // this code was reached.
+  if (!AppendShipToActiveFleet(keyIt->second))
+    return;
+
+  g_fleetSlots.push_back(synth);
+  SaveFleetData();
+  tee_printf("[FLEET] Added ship %d (key %d) to fleet\n", synth, keyIt->second);
+}
+
+// ViewShipDetailsClicked was hooked at RVA 0xBB8AE0 as a plain member function
+// (pThis, ShipId). If that address is also an exec thunk â€” and every other
+// DreadGameUI entry point checked so far is â€” then RDX is FFrame*, not an int,
+// so ShipId was garbage, and skipping the thunk meant FFrame::Code was never
+// advanced past EX_EndFunctionParms, corrupting the bytecode stream. Left
+// disabled until its RVA is verified the same way 0xBB9530 was.
 static void __fastcall hkViewShipDetailsClicked(UUI_OwnedShipsScreen* pThis, int32_t ShipId) {
   tee_printf("[OWNED_SHIPS] ViewShipDetailsClicked for ShipId %d -> Navigating to Customization & Module Details screen\n", ShipId);
   pThis->NavigateToScreen(EUI_Screen::EditShip_Loadout);
@@ -9489,26 +11903,188 @@ void InitEarlyHooks() {
   printf("[INIT] Initializing early hooks (Auth, EAC, Engine)...\n");
   MH_Initialize();
 
-  // Hook GetOwnedShipDataStructs (RVA 0x00BB9530)
-  void* targetGetOwnedData = (void*)(Globals::ModuleBase + 0x00BB9530);
-  if (MH_CreateHook(targetGetOwnedData, &hkGetOwnedShipDataStructs, &oGetOwnedShipDataStructs) == MH_OK) {
-    MH_EnableHook(targetGetOwnedData);
-    tee_printf("[HOOK] Successfully hooked GetOwnedShipDataStructs at RVA 0xBB9530\n");
+  // Owned-ships hooks. Previously installed by MinHook on RVAs 0xBB9530 /
+  // 0xBB95E0 with a plain member-function signature. Ghidra proved those are
+  // UFunction exec thunks, not implementations (registrar FUN_140b057d0 maps
+  // the names to them, and each advances FFrame::Code at +0x20 before calling
+  // the real body). Under the old signature RCX was the widget UObject rather
+  // than an output array, so the hook overwrote that object's vtable pointer
+  // and froze the game.
+  //
+  // Now installed by name through InstallNativeHook, the same mechanism the
+  // other ~15 UFunction hooks in this file use, with the correct
+  // (Context, Stack, RESULT_DECL) signature. Deferred to InitUIHooks timing is
+  // not required â€” these resolve at early-hook time if the class is loaded, so
+  // failure just logs a warning.
+  // Tech tree entry lookup â€” makes the TTM answer to both synthetic and real
+  // cache IDs. See MyHookFindTechTreeEntry.
+  {
+    void *findAddr = (void *)(Globals::ModuleBase + 0x003F51A0);
+    if (MH_CreateHook(findAddr, &MyHookFindTechTreeEntry,
+                      reinterpret_cast<void **>(&OrigFindTechTreeEntry)) == MH_OK) {
+      MH_EnableHook(findAddr);
+      tee_printf("[HOOK] TechTree entry lookup hooked at RVA 0x3F51A0\n");
+    } else {
+      tee_printf("[HOOK] WARNING: failed to hook TechTree entry lookup at RVA 0x3F51A0\n");
+    }
   }
 
-  // Hook GetOwnedShipLoadouts (RVA 0x00BB95E0)
-  void* targetGetOwnedLoadouts = (void*)(Globals::ModuleBase + 0x00BB95E0);
-  if (MH_CreateHook(targetGetOwnedLoadouts, &hkGetOwnedShipLoadouts, &oGetOwnedShipLoadouts) == MH_OK) {
-    MH_EnableHook(targetGetOwnedLoadouts);
-    tee_printf("[HOOK] Successfully hooked GetOwnedShipLoadouts at RVA 0xBB95E0\n");
+  // Fleet diagnostics. Both RVAs were decompiled first and are real C++ bodies
+  // with plain register signatures - no FFrame, no RESULT_DECL - so they are
+  // safe MinHook targets. See the exec-thunk notes above for why that check is
+  // not optional.
+  {
+    void *addLoadoutAddr = (void *)(Globals::ModuleBase + 0x00ABF150);
+    if (MH_CreateHook(addLoadoutAddr, &MyHookScreenAddLoadoutToFleet,
+                      reinterpret_cast<void **>(&OrigScreenAddLoadoutToFleet)) ==
+        MH_OK) {
+      MH_EnableHook(addLoadoutAddr);
+      tee_printf("[HOOK] AddShipToFleetScreen::AddLoadoutToFleet hooked at RVA "
+                 "0xABF150\n");
+    } else {
+      tee_printf("[HOOK] WARNING: failed to hook AddLoadoutToFleet at RVA "
+                 "0xABF150\n");
+    }
+
+    void *removeBodyAddr = (void *)(Globals::ModuleBase + 0x00ADBBA0);
+    if (MH_CreateHook(removeBodyAddr, &MyHookScreenRemoveShipBody,
+                      reinterpret_cast<void **>(&OrigScreenRemoveShipBody)) ==
+        MH_OK) {
+      MH_EnableHook(removeBodyAddr);
+      tee_printf("[HOOK] ManageFleetScreen::RemoveShipFromFleet body hooked at "
+                 "RVA 0xADBBA0\n");
+    }
+
+    void *loadoutFindAddr = (void *)(Globals::ModuleBase + 0x0033FED0);
+    if (MH_CreateHook(loadoutFindAddr, &MyHookFindLoadoutsForShip,
+                      reinterpret_cast<void **>(&OrigFindLoadoutsForShip)) ==
+        MH_OK) {
+      MH_EnableHook(loadoutFindAddr);
+      tee_printf("[HOOK] LoadoutManager::FindLoadoutsForShip hooked at RVA "
+                 "0x33FED0\n");
+    }
+
+    void *fleetCountAddr = (void *)(Globals::ModuleBase + 0x003467F0);
+    if (MH_CreateHook(fleetCountAddr, &MyHookGetFleetShipCount,
+                      reinterpret_cast<void **>(&OrigGetFleetShipCount)) ==
+        MH_OK) {
+      MH_EnableHook(fleetCountAddr);
+      tee_printf("[HOOK] FleetManager::GetFleetShipCount hooked at RVA "
+                 "0x3467F0\n");
+    }
+
+    // Report MH_EnableHook's status too. Logging success on MH_CreateHook alone
+    // is how a hook can be reported "installed" while never firing.
+    {
+      void *removeAddr = (void *)(Globals::ModuleBase + 0x00359B50);
+      MH_STATUS cs = MH_CreateHook(
+          removeAddr, &MyHookRemoveLoadoutFromFleet,
+          reinterpret_cast<void **>(&OrigRemoveLoadoutFromFleet));
+      MH_STATUS es = (cs == MH_OK) ? MH_EnableHook(removeAddr) : cs;
+      tee_printf("[HOOK] RemoveLoadoutFromFleet @0x359B50 create=%d enable=%d "
+                 "orig=%p\n",
+                 (int)cs, (int)es, OrigRemoveLoadoutFromFleet);
+    }
+
+    void *startMmAddr = (void *)(Globals::ModuleBase + 0x004D18D0);
+    if (MH_CreateHook(startMmAddr, &MyHookYMenuStartMatchmaking,
+                      reinterpret_cast<void **>(&OrigYMenuStartMatchmaking)) ==
+        MH_OK) {
+      MH_STATUS es = MH_EnableHook(startMmAddr);
+      tee_printf("[HOOK] YMenu::StartMatchmaking hooked at RVA 0x4D18D0 "
+                 "(enable=%d)\n",
+                 (int)es);
+    } else {
+      tee_printf("[HOOK] WARNING: failed to hook YMenu::StartMatchmaking at "
+                 "RVA 0x4D18D0\n");
+    }
+
+    void *classifyAddr = (void *)(Globals::ModuleBase + 0x00541CD0);
+    if (MH_CreateHook(classifyAddr, &MyHookClassifyLoadoutItemType,
+                      reinterpret_cast<void **>(&OrigClassifyLoadoutItemType)) ==
+        MH_OK) {
+      MH_STATUS es = MH_EnableHook(classifyAddr);
+      tee_printf("[HOOK] ClassifyLoadoutItemType hooked at RVA 0x541CD0 "
+                 "(enable=%d)\n",
+                 (int)es);
+    } else {
+      tee_printf("[HOOK] WARNING: failed to hook ClassifyLoadoutItemType at RVA "
+                 "0x541CD0\n");
+    }
+
+    void *techTreeLookupAddr = (void *)(Globals::ModuleBase + 0x003F5050);
+    if (MH_CreateHook(techTreeLookupAddr, &MyHookFindShipTechTreeData,
+                      reinterpret_cast<void **>(&OrigFindShipTechTreeData)) ==
+        MH_OK) {
+      MH_EnableHook(techTreeLookupAddr);
+      tee_printf("[HOOK] TechTreeManager::FindShipTechTreeData hooked at RVA "
+                 "0x3F5050\n");
+    } else {
+      tee_printf("[HOOK] WARNING: failed to hook FindShipTechTreeData at RVA "
+                 "0x3F5050\n");
+    }
+
+    void *loadoutLookupAddr = (void *)(Globals::ModuleBase + 0x00340950);
+    if (MH_CreateHook(loadoutLookupAddr, &MyHookGetLoadoutForShipID,
+                      reinterpret_cast<void **>(&OrigGetLoadoutForShipID)) ==
+        MH_OK) {
+      MH_EnableHook(loadoutLookupAddr);
+      tee_printf("[HOOK] LoadoutManager::GetLoadoutForShipID hooked at RVA "
+                 "0x340950\n");
+    } else {
+      tee_printf("[HOOK] WARNING: failed to hook GetLoadoutForShipID at RVA "
+                 "0x340950\n");
+    }
   }
 
-  // Hook ViewShipDetailsClicked (RVA 0x00BB8AE0)
-  void* targetViewDetails = (void*)(Globals::ModuleBase + 0x00BB8AE0);
-  if (MH_CreateHook(targetViewDetails, &hkViewShipDetailsClicked, &oViewShipDetailsClicked) == MH_OK) {
-    MH_EnableHook(targetViewDetails);
-    tee_printf("[HOOK] Successfully hooked ViewShipDetailsClicked at RVA 0xBB8AE0\n");
+  // Mmogbrain entitlement scans. These are what make the engine's own
+  // prerequisite evaluation work offline â€” see MyHookHasResearchedScan.
+  {
+    void *researchedAddr = (void *)(Globals::ModuleBase + 0x00547DD0);
+    if (MH_CreateHook(researchedAddr, &MyHookHasResearchedScan,
+                      reinterpret_cast<void **>(&OrigHasResearchedScan)) == MH_OK) {
+      MH_EnableHook(researchedAddr);
+      tee_printf("[HOOK] HasResearched entitlement scan hooked at RVA 0x547DD0\n");
+    } else {
+      tee_printf("[HOOK] WARNING: failed to hook HasResearched scan at RVA 0x547DD0\n");
+    }
+
+    void *purchasedAddr = (void *)(Globals::ModuleBase + 0x00548990);
+    if (MH_CreateHook(purchasedAddr, &MyHookHasPurchasedScan,
+                      reinterpret_cast<void **>(&OrigHasPurchasedScan)) == MH_OK) {
+      MH_EnableHook(purchasedAddr);
+      tee_printf("[HOOK] HasPurchased entitlement scan hooked at RVA 0x548990\n");
+    } else {
+      tee_printf("[HOOK] WARNING: failed to hook HasPurchased scan at RVA 0x548990\n");
+    }
   }
+
+  // EYTechTreeItemState resolver (RVA 0x53C870). Real function body, verified
+  // by decompile â€” it is called directly by FUN_1404f6b50, not registered as a
+  // native UFunction, so MinHook with register params is correct here.
+  {
+    void *stateAddr = (void *)(Globals::ModuleBase + 0x0053C870);
+    if (MH_CreateHook(stateAddr, &MyHookResolveTechTreeItemState,
+                      reinterpret_cast<void **>(&OrigResolveTechTreeItemState)) == MH_OK) {
+      MH_EnableHook(stateAddr);
+      tee_printf("[HOOK] TechTree item state resolver hooked at RVA 0x53C870\n");
+    } else {
+      tee_printf("[HOOK] WARNING: failed to hook item state resolver at RVA 0x53C870\n");
+    }
+  }
+
+  // NOTE: the owned-ships and HasItem name-based hooks are installed in
+  // InitUIHooks, not here. At early-hook time the DreadGameUI classes are not
+  // loaded yet, so GetObjByName fails and the install silently no-ops â€” the
+  // first run of this code logged "Could not find UFunction" for all three.
+
+  // ViewShipDetailsClicked (RVA 0x00BB8AE0): DISABLED pending verification.
+  // Same unverified-RVA pattern that made the two hooks above corrupt a
+  // UObject. If 0xBB8AE0 is an exec thunk then RDX is FFrame*, ShipId is
+  // garbage, and bypassing the thunk leaves FFrame::Code un-advanced. Verify
+  // with `xrefs_to BB8AE0` / `decompile_at BB8AE0` before re-enabling.
+  (void)&hkViewShipDetailsClicked; // address-of, not a call (silences C4551)
+  (void)oViewShipDetailsClicked;
 
   // Install VEH to prevent background-thread crashes from killing the game
   g_mainThreadId = GetCurrentThreadId();
@@ -9626,21 +12202,24 @@ void InitEarlyHooks() {
     }
   }
 
-  // Hook YCtAInventoryInterface::HasItem at known RVA 0x0075C430
-  void *hasItemAddr = (void *)(Globals::ModuleBase + 0x0075C430);
-  {
-    MH_STATUS status = MH_CreateHook(
-        hasItemAddr, reinterpret_cast<LPVOID>(MyHookHasItemNative),
-        reinterpret_cast<void **>(&OrigHasItemNative));
-    if (status == MH_OK) {
-      MH_EnableHook(hasItemAddr);
-      printf("[HOOK] Native HasItem MinHook detour installed at RVA 0x75C430 (%p)\n",
-             hasItemAddr);
-    } else {
-      printf("[HOOK] WARNING: Failed to install native HasItem hook at RVA 0x75C430 (status=%d)\n",
-             (int)status);
-    }
-  }
+  // YCtAInventoryInterface::HasItem.
+  //
+  // Previously MinHooked at RVA 0x75C430 with the signature (void* pThis,
+  // int32_t itemID) -> bool. Ghidra decompile of FUN_14075c430 shows that
+  // address is the UFunction exec thunk, not the body:
+  //     void exec(UObject* Context, FFrame& Stack, bool* RESULT_DECL)
+  // It reads itemID out of the FFrame, advances FFrame::Code at +0x20
+  // (P_FINISH), calls the real body FUN_140306c80 (RVA 0x306C80), and writes
+  // the answer to *RESULT_DECL.
+  //
+  // Under the old signature the detour returned its bool in RAX, which the
+  // caller never reads, and never wrote RESULT_DECL â€” so HasItem actually
+  // returned whatever happened to be in that stack slot, not true. It also
+  // skipped P_FINISH, leaving the bytecode pointer un-advanced. The logged
+  // "itemID" was really the FFrame pointer.
+  //
+  // Now hooked by name with the correct signature, from InitUIHooks â€” the
+  // DreadGame classes are not resolvable this early.
 
   // Hook FUN_140480f70 (FindCachedDataEntry) â€” the bottleneck that prevents
   // item processing Both item loops in FUN_1404f3190 are inside `if (local_240
@@ -9892,8 +12471,45 @@ void InitUIHooks() {
   InstallNativeHook(
       "Function DreadGameUI.UI_EditShipSubPanel.IsItemOwnedByPlayer",
       MyHookIsItemOwnedByPlayer, &OriginalIsItemOwnedByPlayerFunc);
+  // Was MyHookHasItemUFunction, which had the right signature but returned
+  // without calling the original, so FFrame::Code was never advanced past
+  // EX_EndFunctionParms. MyHookHasItemNative runs the original first (params +
+  // P_FINISH + a real RESULT_DECL) and then forces the answer.
   InstallNativeHook("Function DreadGame.YCtAInventoryInterface.HasItem",
-                    MyHookHasItemUFunction, &OriginalHasItemUFunctionFunc);
+                    MyHookHasItemNative, &OrigHasItemNativeFunc);
+
+  // Add Ship To Fleet: populate the picker from owned ships, and settle the
+  // add locally since HandleMmogbrainAddedToFleet can never arrive offline.
+  InstallNativeHook(
+      "Function DreadGameUI.UI_AddShipToFleetScreen."
+      "GetAvailableShipsForActiveFleetType",
+      MyHookGetAvailableShipsForActiveFleetType,
+      &OrigGetAvailableShipsForFleetFunc);
+  InstallNativeHook("Function DreadGameUI.UI_AddShipToFleetScreen.AddShipToFleet",
+                    MyHookAddShipToFleet, &OrigAddShipToFleetFunc);
+
+  // Diagnostics for the broken remove path - see MyHookScreenRemoveShipFromFleet.
+  InstallNativeHook(
+      "Function DreadGameUI.UI_ManageFleetScreen.RemoveShipFromFleet",
+      MyHookScreenRemoveShipFromFleet, &OrigScreenRemoveShipFromFleet);
+  InstallNativeHook(
+      "Function DreadGameUI.UI_ManageFleetScreen.SetCurrentShipId",
+      MyHookScreenSetCurrentShipId, &OrigScreenSetCurrentShipId);
+
+  // The ship detail panel's research/claim/owned button state.
+  InstallNativeHook(
+      "Function DreadGameUI.UI_ShipDetailsSubPanel.GetShipResearchPurchaseState",
+      MyHookGetShipResearchPurchaseState,
+      &OrigGetShipResearchPurchaseStateFunc);
+
+  // Owned-ships hooks live here, not in InitEarlyHooks: the DreadGameUI
+  // classes are not loaded early enough for GetObjByName to resolve them, and
+  // the early attempt logged "Could not find UFunction" and silently did
+  // nothing.
+  InstallNativeHook("Function DreadGameUI.UI_OwnedShipsScreen.GetOwnedShipDataStructs",
+                    hkGetOwnedShipDataStructs, &OrigGetOwnedShipDataStructsFunc);
+  InstallNativeHook("Function DreadGameUI.UI_OwnedShipsScreen.GetOwnedShipLoadouts",
+                    hkGetOwnedShipLoadouts, &OrigGetOwnedShipLoadoutsFunc);
   InstallNativeHook(
       "Function DreadGameUI.UI_EditShipSubPanel.IsCurrentShipOwnedByPlayer",
       MyHookIsCurrentShipOwnedByPlayer,
@@ -9917,6 +12533,23 @@ void InitUIHooks() {
                     MyHookGetShipData, &OriginalGetShipDataFunc);
   InstallNativeHook("Function DreadGameUI.UI_ShipFilterWidget.GetUIShipData",
                     MyHookGetUIShipData, &OriginalGetUIShipDataFunc);
+
+  // Match entry. Hooked by name rather than by RVA because Blueprint reaches
+  // these through EX_FinalFunction, which calls UFunction::Func directly and
+  // bypasses ProcessEvent entirely - invisible to both a ProcessEvent tracer
+  // and to the wrong-overload MinHook that never fired. Swapping Func catches
+  // the call regardless of dispatch. All three names are installed because the
+  // Proving Grounds PLAY button and the main-menu Quickplay button demonstrably
+  // take different routes: only Quickplay produces a visible timer widget.
+  InstallNativeHook(
+      "Function DreadGameUI.YMatchmakingInterpreter.StartMatchmaking",
+      MyHookMmInterpStartMatchmaking, &OrigMmInterpStartMatchmaking);
+  InstallNativeHook(
+      "Function DreadGameUI.YMatchmakingInterpreter.StartQuickPlayMatchmaking",
+      MyHookMmInterpStartQuickPlay, &OrigMmInterpStartQuickPlay);
+  InstallNativeHook(
+      "Function DreadGameUI.UI_PersistentScreen.StartMatchmaking",
+      MyHookPersistentStartMatchmaking, &OrigPersistentStartMatchmaking);
 
   // Hook GetCurrentShipItemData on the CORRECT class (UI_EditShipScreen, not
   // UI_EditShipSubPanel)

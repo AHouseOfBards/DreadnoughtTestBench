@@ -34,3 +34,36 @@
 
 x64
 .vs
+
+# --- Test Bench fork additions ---
+
+# Third-party SDKs with their own redistribution terms (Steamworks etc.)
+ThirdParty/
+
+# Scratch: one-off patch scripts, backups and diffs from editing sessions
+fix_*.py
+restore_hook.py
+pristine_dllmain.cpp
+*.bak
+diff_output.txt
+
+# Runtime output produced next to the game executable
+dread_mod_log*.txt
+dread_debug.log
+dread_fleet_save*.json
+
+# Reverse-engineering working files. These derive from the game executable and
+# must never be committed - see "What is deliberately not in this repo".
+ghidra_output/
+GHI/
+*.gpr
+*.rep/
+
+# Extracted game content. Copyrighted; not redistributable under any
+# circumstances.
+extracted_*/
+Extracted*/
+*.pak
+*.uasset
+*.umap
+*.locres
