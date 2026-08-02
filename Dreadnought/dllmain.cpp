@@ -1322,8 +1322,279 @@ static bool g_hasWipedOnce =
     false; // Moved to global to ensure strict one-time execution
 
 // Native UFunction hijacking helper
+// ---------------------------------------------------------------------------
+// Hook bisect gate - diagnostics only, no effect on a normal run.
+//
+// Proven 2026-08-01: the unmodified executable hosts MP_Amirani_P headless
+// (UDP bound, no crash), and the same launch with this DLL present dies on
+// "GameState_TDM_BP_C failed to route PostInitializeComponents". So one of our
+// own hooks breaks GameState init. Finding which needs many launches, and a
+// rebuild per step is too slow, so both switches are read from the environment
+// at install time:
+//
+//   DN_HOOKS_MAX=N    install only the first N by-name hooks, in install
+//                     order. N=0 disables every one of them.
+//   DN_HOOKS_OFF=a,b  skip any hook whose name contains a listed substring.
+//
+// Unset means "install everything", so shipping behaviour is unchanged.
+static std::string BisectGetEnv(const char *name) {
+  char buf[1024];
+  DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+  if (n == 0 || n >= sizeof(buf))
+    return std::string();
+  return std::string(buf, n);
+}
+
+// Resolve an RVA to the entry point of the function containing it, using the
+// PE exception directory (.pdata). Returns 0 if the RVA is not inside any
+// function at all.
+//
+// x64 PE images carry a RUNTIME_FUNCTION per function with exact
+// Begin/End RVAs - 224,934 of them in this executable. That makes "is this RVA
+// a function entry?" an exact lookup rather than a guess, which matters because
+// this codebase has a history of RVAs derived by scanning for a CALL and then
+// patched as though they were entries. Byte heuristics are not good enough:
+// "49 8B CC" (mov rcx,r12) ends in 0xCC and looks like INT3 padding.
+static uint32_t ResolveFunctionEntry(uint32_t rva) {
+  uintptr_t base = (uintptr_t)Globals::ModuleBase;
+  if (!base)
+    return 0;
+  PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+    return 0;
+  PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE)
+    return 0;
+
+  IMAGE_DATA_DIRECTORY &dir =
+      nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+  if (!dir.VirtualAddress || dir.Size < sizeof(RUNTIME_FUNCTION))
+    return 0;
+
+  RUNTIME_FUNCTION *table = (RUNTIME_FUNCTION *)(base + dir.VirtualAddress);
+  int count = (int)(dir.Size / sizeof(RUNTIME_FUNCTION));
+
+  int lo = 0, hi = count - 1;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (rva < table[mid].BeginAddress)
+      hi = mid - 1;
+    else if (rva >= table[mid].EndAddress)
+      lo = mid + 1;
+    else
+      return table[mid].BeginAddress;
+  }
+  return 0;
+}
+
+// As ResolveFunctionEntry, but also yields the function's end RVA.
+static bool ResolveFunctionRange(uint32_t rva, uint32_t *outBegin,
+                                 uint32_t *outEnd) {
+  uintptr_t base = (uintptr_t)Globals::ModuleBase;
+  if (!base)
+    return false;
+  PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+    return false;
+  PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE)
+    return false;
+  IMAGE_DATA_DIRECTORY &dir =
+      nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+  if (!dir.VirtualAddress || dir.Size < sizeof(RUNTIME_FUNCTION))
+    return false;
+  RUNTIME_FUNCTION *table = (RUNTIME_FUNCTION *)(base + dir.VirtualAddress);
+  int lo = 0, hi = (int)(dir.Size / sizeof(RUNTIME_FUNCTION)) - 1;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (rva < table[mid].BeginAddress)
+      hi = mid - 1;
+    else if (rva >= table[mid].EndAddress)
+      lo = mid + 1;
+    else {
+      *outBegin = table[mid].BeginAddress;
+      *outEnd = table[mid].EndAddress;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Filtered FTimerManager::SetTimer
+//
+// The WebServicesPlugin schedules repeating timers (touch session, ping, market
+// bundles, legal docs, mmog connection). Offline their callbacks fire on
+// TaskGraphThread against dead web-service objects and take the game down about
+// a minute after launch.
+//
+// The previous fix stamped RET (0xC3) over thirteen addresses including
+// FTimerManager::SetTimer itself. That was doubly wrong: seven of the thirteen
+// were not function entries at all (six mid-body, one not inside any function),
+// and even the six valid ones broke actor initialisation - measured 0/6 map
+// loads with only the verified RETs applied versus 6/6 with none.
+//
+// So let every scheduler run normally and filter at the timer instead. The
+// detour checks its return address: if the call came from inside one of the
+// known WebServicesPlugin scheduler functions - exact [begin,end) ranges from
+// .pdata, not an RVA guess - it forwards to the original with rate = 0. The
+// engine's own "rate <= 0" path (COMISS XMM6,XMM0 / JBE at 0x1C8F7BC) then
+// clears the handle properly, so no engine invariant is broken by us.
+//
+// Signature confirmed by disassembly at 0x1C8F760: RCX=this, RDX=FTimerHandle*,
+// R8=delegate, XMM3=rate, [RBP+0xC0]=bool bLoop, [RBP+0xC8]=float firstDelay.
+// True when a real backend is present (set in DllMain). Splits the mod in two:
+//
+//   offline bring-up  - fake login, patched ValidateSession, the "0w0" auth
+//                       token, the firmament cert bypass, forced hangar,
+//                       synthetic fleet, and WebServicesPlugin timer
+//                       suppression. All necessary with no server, all
+//                       actively harmful with one.
+//   in-match fixes    - camera fade, spectator/input, spawn loadout fallback.
+//                       Safe either way; the loadout fallback only fires when
+//                       the engine itself produces nothing.
+//
+// Declared this early because MyHookSetTimer below is one of its consumers.
+static bool g_serverMode = false;
+
+typedef void(__fastcall *tSetTimer)(void *self, void *handle, void *del,
+                                    float rate, bool bLoop, float firstDelay);
+static tSetTimer OrigSetTimer = nullptr;
+
+struct FuncRange {
+  uint32_t begin, end;
+};
+static std::vector<FuncRange> g_webServiceRanges;
+static volatile LONG g_timersSuppressed = 0;
+
+void __fastcall MyHookSetTimer(void *self, void *handle, void *del, float rate,
+                               bool bLoop, float firstDelay) {
+  uintptr_t ret = (uintptr_t)_ReturnAddress();
+  uintptr_t base = (uintptr_t)Globals::ModuleBase;
+  // Offline only. These timers exist to poll the web-service session; with no
+  // backend their callbacks touch dead objects and take the process down after
+  // ~1 minute, which is why they are dropped. With a real server they are the
+  // session's heartbeat - the client's Mmogbrain connect state machine
+  // (state at conn+0x10, 5001 ms budget per step) is advanced by them, so
+  // suppressing them strands the login at "phase 2" even though TLS, auth and
+  // chat all succeeded. Same shape as the "0w0" auth token: an offline
+  // workaround that becomes the bug once a backend exists.
+  if (base && ret > base && !g_serverMode) {
+    uint32_t rva = (uint32_t)(ret - base);
+    for (size_t i = 0; i < g_webServiceRanges.size(); i++) {
+      if (rva >= g_webServiceRanges[i].begin && rva < g_webServiceRanges[i].end) {
+        LONG n = InterlockedIncrement(&g_timersSuppressed);
+        if (n <= 20)
+          printf("[TIMER] Suppressed WebServicesPlugin timer from RVA 0x%X "
+                 "(rate was %.2f)\n",
+                 rva, rate);
+        // Hand it to the engine as a cancel rather than skipping the call, so
+        // the handle is cleared through the engine's own path.
+        if (OrigSetTimer)
+          OrigSetTimer(self, handle, del, 0.0f, false, -1.0f);
+        return;
+      }
+    }
+  }
+  if (OrigSetTimer)
+    OrigSetTimer(self, handle, del, rate, bLoop, firstDelay);
+}
+
+static int g_nativeHookIndex = 0;
+
+static bool HookGateAllows(const char *funcName) {
+  static std::string off = BisectGetEnv("DN_HOOKS_OFF");
+  static std::string maxStr = BisectGetEnv("DN_HOOKS_MAX");
+  static int maxHooks = maxStr.empty() ? -1 : atoi(maxStr.c_str());
+
+  int idx = g_nativeHookIndex++;
+
+  if (maxHooks >= 0 && idx >= maxHooks) {
+    printf("[BISECT] #%d SKIP (DN_HOOKS_MAX=%d): %s\n", idx, maxHooks, funcName);
+    return false;
+  }
+  if (!off.empty() && funcName) {
+    size_t start = 0;
+    while (start <= off.size()) {
+      size_t comma = off.find(',', start);
+      std::string tok = off.substr(start, comma == std::string::npos
+                                              ? std::string::npos
+                                              : comma - start);
+      if (!tok.empty() && strstr(funcName, tok.c_str())) {
+        printf("[BISECT] #%d SKIP (matches '%s'): %s\n", idx, tok.c_str(),
+               funcName);
+        return false;
+      }
+      if (comma == std::string::npos)
+        break;
+      start = comma + 1;
+    }
+  }
+  printf("[BISECT] #%d install: %s\n", idx, funcName);
+  return true;
+}
+
+// RVA-hook counterpart of the gate above. Every MH_CreateHook call in this
+// file is routed through this, so the same bisect can disable MinHook hooks on
+// game code:
+//
+//   DN_RVA_MAX=N     create only the first N RVA hooks, in install order
+//   DN_RVA_OFF=a,b   skip hooks whose RVA is listed (hex, e.g. 0xBFCA40)
+//
+// Returning a non-MH_OK status makes each call site behave exactly as it does
+// when MinHook genuinely fails: the paired MH_EnableHook is either skipped or
+// fails harmlessly, and the detour never runs - so the Orig pointer is never
+// called through, even where a site left it unguarded.
+static int g_rvaHookIndex = 0;
+
+static MH_STATUS MH_CreateHookGated(void *target, void *detour, void **orig) {
+  static std::string off = BisectGetEnv("DN_RVA_OFF");
+  static std::string maxStr = BisectGetEnv("DN_RVA_MAX");
+  static int maxHooks = maxStr.empty() ? -1 : atoi(maxStr.c_str());
+
+  int idx = g_rvaHookIndex++;
+
+  uintptr_t base = (uintptr_t)Globals::ModuleBase;
+  uintptr_t t = (uintptr_t)target;
+  bool inModule = base && t > base && (t - base) < 0x10000000;
+
+  char rvaTxt[32];
+  if (inModule)
+    sprintf_s(rvaTxt, "0x%llX", (unsigned long long)(t - base));
+  else
+    strcpy_s(rvaTxt, "extern");
+
+  if (maxHooks >= 0 && idx >= maxHooks) {
+    printf("[BISECT] rva #%d SKIP (DN_RVA_MAX=%d): %s\n", idx, maxHooks,
+           rvaTxt);
+    return MH_ERROR_NOT_EXECUTABLE;
+  }
+  if (!off.empty() && inModule) {
+    size_t start = 0;
+    while (start <= off.size()) {
+      size_t comma = off.find(',', start);
+      std::string tok = off.substr(start, comma == std::string::npos
+                                              ? std::string::npos
+                                              : comma - start);
+      if (!tok.empty() && _stricmp(tok.c_str(), rvaTxt) == 0) {
+        printf("[BISECT] rva #%d SKIP (DN_RVA_OFF): %s\n", idx, rvaTxt);
+        return MH_ERROR_NOT_EXECUTABLE;
+      }
+      if (comma == std::string::npos)
+        break;
+      start = comma + 1;
+    }
+  }
+
+  printf("[BISECT] rva #%d create: %s\n", idx, rvaTxt);
+  return MH_CreateHook(target, detour, orig);
+}
+
 void InstallNativeHook(const char *funcName, void *hookFunc,
                        void **origFuncOut) {
+  if (!HookGateAllows(funcName))
+    return;
+
   // Guard: if already hooked (origFuncOut already set and != hookFunc), skip.
   // This prevents double-hooking when trying multiple name variants.
   if (origFuncOut && *origFuncOut != nullptr && *origFuncOut != hookFunc) {
@@ -1666,6 +1937,14 @@ struct LoadedShipInfo {
 static LoadedShipInfo g_loadedShips[MAX_LOADED_SHIPS] = {};
 static int g_numLoadedShips = 0;
 
+// The loadout the player last activated in the frontend. Recorded at the two
+// places that switch the active ship in the hangar, and read back after travel
+// by MyHookGetLoadoutForSpawn to decide which ship to spawn - offline nothing
+// replicates the choice into the match, so this global is the only surviving
+// record of it. Safe to keep across travel because every object stored in
+// g_loadedShips is pinned by HardenedPinToRootSet before it lands there.
+static UObject *g_lastActivatedLoadout = nullptr;
+
 // Game-thread asset loading dispatch
 static tLoadPackage g_pLoadPackage = nullptr;
 static tStaticLoadObject_Global g_pStaticLoadObject = nullptr;
@@ -1993,6 +2272,124 @@ static int g_numFleetTierRanges = 0;
 
 // Audit tracer switch Ã¢â‚¬â€ see the [TRACE] block in ProcessEventHook.
 static bool g_auditTraceEnabled = true;
+
+// Set once a match travel has been issued; never cleared for the rest of the
+// session.
+//
+// UGameEngineTick carries a stack of frontend-only passes - hangar crew
+// animation, the customization preview actor, hangar level script init, the
+// camera override - that walk GWorld->Levels and sweep GObjects every single
+// frame. That is survivable while sitting in the hangar, but a ServerTravel
+// tears the world down underneath them, and the first one to dereference a
+// half-destroyed PersistentLevel takes the process with it. That is exactly how
+// the first successful Proving Grounds travel died: the map loaded, then
+// UGameEngineTick faulted at the crew-animation pass.
+//
+// None of those passes mean anything once we have left for a match, so the fix
+// is simply to stop running them. Declared up here rather than beside the
+// travel code because the tick hook is far earlier in the file.
+static bool g_matchTravelIssued = false;
+
+// Set by MyHookSpawnDefaultPawn when the engine builds a ship but leaves the
+// controller without one; consumed by the post-travel pass in UGameEngineTick,
+// which possesses it a frame later. Declared here for the same reason as
+// g_matchTravelIssued - the tick hook sits far earlier in the file than the
+// spawn hook that writes them.
+static void *g_pendingPossessPawn = nullptr;
+static int g_possessAttempts = 0;
+
+// g_serverMode is declared up beside MyHookSetTimer, which needs it.
+//
+// Measured 2026-08-02 with all six services up: before the split the client
+// made zero requests to any of them and held no established connections,
+// because the mod answered RequestSession itself before anything went out on
+// the wire.
+
+// DIAGNOSTIC: DN_FORCE_TRAVELED=1 starts up as if a travel had already been
+// issued, so the frontend passes below never run.
+//
+// This exists because the headless harness ("<map>?listen" -server) boots
+// straight into a gameplay map without ever going through TravelToMatchMap, so
+// g_matchTravelIssued stays false and those passes walk GWorld for the whole of
+// map load - which the real Play path does not do. Without this switch the
+// harness cannot reproduce the conditions it is meant to be testing.
+static bool ForceTraveledFromEnv() {
+  char buf[8];
+  DWORD n = GetEnvironmentVariableA("DN_FORCE_TRAVELED", buf, sizeof(buf));
+  return (n == 1 && buf[0] == '1');
+}
+
+// Every m_availableGameModeList TArray we aliased onto an authored array.
+//
+// The alias makes the mode list appear offline without copying 0x70-byte
+// entries full of refcounted FString/FText members. It is sound only while
+// nothing destroys either array - which was true in the hangar, and stopped
+// being true the moment a match travel tore the frontend down. Two TArrays
+// referring to one buffer means those refcounts get released twice, and the
+// second pass through FYMenuGameModeDefinition's destructor (0x4A59E0) calls a
+// virtual through an already-freed vtable. That is the DEP-execute storm that
+// killed the first two Proving Grounds attempts.
+//
+// So the alias has to be undone before the world goes away. Stored as raw
+// addresses rather than TArrayRaw* because TArrayRaw is declared further down.
+static std::vector<void *> g_aliasedGameModeArrays;
+
+// Detach our hand-built tech tree tables from the live YTechTreeManager.
+//
+// TTM+0x38/+0x48/+0x58/+0x68 are filled with arrays we allocated ourselves and
+// wired in by hand. They are not real UObject-graph data, so when the garbage
+// collector walks the TechTreeManager's reference token stream it hits tokens
+// it cannot interpret - the "Unknown token" crash the GC patch exists to
+// suppress. That patch makes unknown tokens fall through to EndOfStream, which
+// stops the collector processing the rest of that object's references.
+//
+// Sitting in the hangar that is survivable. A level transition is not.
+// UEngine::LoadMap calls CollectGarbage explicitly to tear the old world down,
+// and a collector that bails out of a token stream early can fail to mark
+// objects that are genuinely reachable. They then get collected, and an actor
+// that is PendingKill when AActor::PostInitializeComponents runs never sets
+// bActorInitialized - which is precisely the assertion we hit:
+//
+//   GameState_TDM_BP_C ... failed to route PostInitializeComponents
+//
+// So hand the TTM back its empty arrays before travelling. The frontend is
+// being destroyed anyway and nothing reads these again this session; what
+// matters is that GC sees a TechTreeManager it can trace correctly.
+static void UnwireTechTreeManager() {
+  if (!g_ttmPtr)
+    return;
+  // No memory guard needed: g_ttmPtr is the live TechTreeManager we captured
+  // ourselves, and these are the exact offsets we already wrote when
+  // populating it. (IsWritableMemory is defined further down the file anyway.)
+  const uint32_t arrays[] = {0x38, 0x48, 0x58, 0x68};
+  for (uint32_t off : arrays) {
+    uint8_t *p = g_ttmPtr + off;
+    *(void **)(p + 0x00) = nullptr; // Data
+    *(int32_t *)(p + 0x08) = 0;     // Count
+    *(int32_t *)(p + 0x0C) = 0;     // Max
+  }
+  printf("[TECHTREE] Un-wired TTM arrays before travel so GC can trace it.\n");
+  g_ttmPtr = nullptr;
+}
+
+// Drop every alias, leaving each authored array as the sole owner of its
+// buffer so the teardown frees it exactly once.
+static void UnaliasGameModeArrays() {
+  int cleared = 0;
+  for (void *arr : g_aliasedGameModeArrays) {
+    if (!arr)
+      continue;
+    uint8_t *p = (uint8_t *)arr;
+    *(void **)(p + 0x00) = nullptr; // Data
+    *(int32_t *)(p + 0x08) = 0;     // Count
+    *(int32_t *)(p + 0x0C) = 0;     // Max
+    cleared++;
+  }
+  g_aliasedGameModeArrays.clear();
+  if (cleared)
+    printf("[GAMEMODE] Un-aliased %d game mode array(s) before travel.\n",
+           cleared);
+}
 
 // Is [p, p+size) committed and writable right now?
 //
@@ -2647,6 +3044,33 @@ struct ShipDef {
   int proxyFallback;    // index into g_loadedShips for icon fallback
 };
 
+// NAME PROVENANCE - read before "correcting" any name below.
+//
+// Every name here is verified against Snib's datamine of client 2022-03-15
+// (the last live build), whose Ship Stats tab lists all 53 hulls with class,
+// subclass and tier. All 52 below match it exactly, Simargl included
+// (Dreadnought Medium T1). The 53rd is "Energy Dread", which never shipped to
+// players.
+//
+// DO NOT use ItemIDConversionTable as the naming authority. It is a
+// legacy OldItemID -> NewItemID mapping and its Name column holds the OLD
+// names, so it disagrees with the live client on at least four hulls:
+//
+//   ScoutLight  T3   live: Machias    conversion table: "Lerwick (T3)"
+//   ScoutLight  T5   live: Nevis      conversion table: "Bakar"
+//   AssaultHeavy T3  live: Dola       conversion table: "Kama"
+//   ScoutHeavy  T4   live: Stribog    conversion table: "Perun (T4)"
+//
+// The giveaways are that the stale entries carry "(T3)"/"(T4)" suffixes in the
+// name and old class labels like "L Corvette"/"H Corvette", and that the pairs
+// share identical in-game descriptions - Stribog and Perun are word-for-word
+// the same ship, "commissioned by Akula's Head of Statecraft". These four
+// names were briefly "fixed" to the legacy set on 2026-08-01 and reverted the
+// same day.
+//
+// If a name needs changing, check the datamine roster or the live client's own
+// cached item data. An asset path or conversion-table row is not enough.
+
 // Jupiter Arms Ã¢â‚¬â€ 17 ships (1Ã¢â€ â€™2Ã¢â€ â€™4Ã¢â€ â€™5Ã¢â€ â€™5)
 // Manufacturer confirmed from in-game ship descriptions
 static const ShipDef s_jupiterArms[] = {
@@ -2884,6 +3308,31 @@ typedef uint8_t(__fastcall *tResolveTechTreeItemState)(void *entry,
                                                        void *worldCtx,
                                                        int32_t ctxId);
 static tResolveTechTreeItemState OrigResolveTechTreeItemState = nullptr;
+
+// Address of the 0x53C870 patch, kept so it can be lifted before map travel.
+//
+// RETRACTION, read this before trusting any comment about 0x53C870. A headless
+// bisect on 2026-08-01 appeared to prove this hook was the sole cause of
+//
+//   GameState_TDM_BP_C ... failed to route PostInitializeComponents
+//
+// It is not. Every step of that bisect was a single run of a NON-DETERMINISTIC
+// process, so the whole result was noise read as signal. Measured properly, six
+// runs per configuration on Amirani:
+//
+//   no mod at all         6/6 survived
+//   mod, default          1/6 survived
+//   mod, frontend passes forced off   0/6 survived
+//
+// The mod really does cause it - the no-mod baseline is clean - but it is a
+// race that fires most of the time, not any one hook. Identical configurations
+// have given opposite verdicts back to back.
+//
+// The disable below is therefore NOT a proven fix. It is kept only because this
+// hook serves the tech tree and purchase screens and genuinely has no job
+// during a match, so lifting it costs nothing. Do not cite it as the cure, and
+// do not conclude anything about this bug from a single headless run.
+static void *g_techStateHookAddr = nullptr;
 
 uint8_t __fastcall MyHookResolveTechTreeItemState(void *entry, void *worldCtx,
                                                   int32_t ctxId) {
@@ -3928,6 +4377,7 @@ void __fastcall MyHookGetCurrentShipItemData(UObject *Context, void *Stack,
                                          ->PlayerController;
             if (pc && loadoutClass) {
               pc->AddAndActiveLoadoutFromBlueprint(loadoutClass);
+              g_lastActivatedLoadout = loadout;
               printf("[LOADOUT] Switched active loadout to %s (class=%d "
                      "tier=%d)\n",
                      loadout->GetFullName().c_str(), bpClass, matchedTier);
@@ -4088,6 +4538,7 @@ void ProcessSetSelectedShip(UObject *Context, void *Stack, void *RESULT_DECL,
               if (lm) {
                 lm->m_activeLoadout = (UYShipLoadout *)loadout;
                 lm->ActivateLoadout((UYShipLoadout *)loadout, true);
+                g_lastActivatedLoadout = loadout;
                 printf("[SSS] [%s] Activated loadout for synthetic ID %d "
                        "(class=%d tier=%d)\n",
                        screenName, shipID, bpClass, matchedTier);
@@ -6020,6 +6471,9 @@ void InjectOfflineFleet(AYPlayerController *pc) {
           avail->Data = full->Data;
           avail->Count = full->Count;
           avail->Max = full->Count;
+          // Remember it so the alias can be undone before a match travel -
+          // see UnaliasGameModeArrays for why leaving it in place crashes.
+          g_aliasedGameModeArrays.push_back((void *)avail);
           printf("[GAMEMODE]     -> published %d game modes\n", full->Count);
         }
 
@@ -7670,7 +8124,7 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
     //
     // TEMPORARY: Skipping the first game screen and loading screen for now.
     // We will add the proper timed loading delay sequence back in later.
-    if (g_fleetInjected && menuState < STATE_LOADING_HANGAR) {
+    if (!g_serverMode && g_fleetInjected && menuState < STATE_LOADING_HANGAR) {
       printf("[STATE] Advancing menuState from %d to STATE_LOADING_HANGAR "
              "(fleet injected, hangar ready)\n",
              (int)menuState);
@@ -7966,6 +8420,21 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
 
   if (menuState == STATE_TITLE &&
       funcName.find("UI_Screen_Title_C.RequestSession") != std::string::npos) {
+    // RequestSession IS the client's real login. With a backend up, let it go
+    // out on the wire untouched - answering it here is what kept mmogbrain at
+    // zero requests and left the ownership store empty. Staying in STATE_TITLE
+    // keeps every downstream offline step switched off, since they are all
+    // gated on menuState.
+    if (g_serverMode) {
+      static bool s_saidIt = false;
+      if (!s_saidIt) {
+        s_saidIt = true;
+        tee_printf("[LOAD] Server mode: letting the real RequestSession run "
+                   "(no fake login, no ValidateSession patch, no forced "
+                   "hangar).\n");
+      }
+      return;
+    }
     menuState = STATE_LOADING_DELAY;
     g_loadingStartTimeMs = GetTickCount64();
     printf("[LOAD] Starting login sequence...\n");
@@ -8157,7 +8626,16 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
   // function === We set it directly in HandleHangarStateUpdate above. No
   // ProcessEvent intercept needed. Also keep it true continuously in case
   // Blueprint resets it:
-  if (g_capturedHUD && g_techTreeInspected) {
+  //
+  // Only while we are actually in the frontend. This used to run for the whole
+  // session, so after travelling into a match the Blueprint would correctly
+  // clear IsHangarReady and we would immediately force it back to true, every
+  // frame, for the entire match. The observed result was a match rendering
+  // behind an opaque frontend layer: black screen, mouse cursor still visible,
+  // "Mouse.hide failed" from Scaleform, WASD going to the UI instead of the
+  // ship - while the pawn was spawned, possessed and correctly framed by the
+  // camera the whole time.
+  if (!g_matchTravelIssued && g_capturedHUD && g_techTreeInspected) {
     bool *isReady = (bool *)((uintptr_t)g_capturedHUD + 0x05D8);
     if (!*isReady) {
       *isReady = true;
@@ -8911,7 +9389,7 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
   // ----------------------------------------------------
   // FORCE HANGAR CREW ANIMATION DELTA TIME
   // ----------------------------------------------------
-  if (*UWorld::GWorld) {
+  if (!g_matchTravelIssued && *UWorld::GWorld) {
     UWorld *world = *UWorld::GWorld;
     bool onHangarMap = false;
     if (world->PersistentLevel) {
@@ -8938,9 +9416,356 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
   }
 
   // ----------------------------------------------------
+  // POST-TRAVEL SPAWN DIAGNOSTICS
+  // ----------------------------------------------------
+  // Every other pass in this function is gated on !g_matchTravelIssued, so the
+  // mod goes quiet precisely when the match begins - which is where the
+  // remaining problems live. This runs only after travel, only a few times, and
+  // only reads. It answers the one question the log cannot: a spawn that
+  // reports no error is not proof of a pawn the player is looking through.
+  if (g_matchTravelIssued && *UWorld::GWorld) {
+    static int s_diagCount = 0;
+    static float s_diagAccum = 0.0f;
+    s_diagAccum += DeltaTime;
+    // 5s apart and 60 samples, so the window spans the whole pre-match
+    // countdown and the spawn that follows it. The first version sampled for
+    // 20s total and expired long before the countdown ended, which is exactly
+    // the interval that matters.
+    if (s_diagCount < 60 && s_diagAccum >= 5.0f) {
+      s_diagAccum = 0.0f;
+      s_diagCount++;
+
+      // The 3D scene being black while the 2D UI still draws points at the
+      // world, not the camera. Amirani builds its geometry from streamed
+      // sublevels, so report what actually got loaded.
+      try {
+        UWorld *sw = *UWorld::GWorld;
+        TArray<ULevelStreaming *> &sls = sw->StreamingLevels;
+        int loadedCount = 0;
+        for (int i = 0; i < sls.Count(); ++i)
+          if (sls[i] && sls[i]->IsLevelLoaded())
+            loadedCount++;
+        tee_printf("[INMATCH %d] streamingLevels=%d loaded=%d worldLevels=%d\n",
+                   s_diagCount, sls.Count(), loadedCount, sw->Levels.Count());
+        // Name every sublevel once, and force the unloaded ones in. The sky is
+        // black and distant terrain is missing while 6 of 22 sublevels never
+        // load, which is exactly where a skybox and backdrop geometry live.
+        //
+        // Flags at +0xB0: bits 0-2 padding, bit3 bShouldBeVisibleInEditor,
+        // bit4 bLocked, bit5 bShouldBeLoaded, bit6 bShouldBeVisible.
+        //
+        // Caveat worth keeping in view: Amirani picks a "Level Variation Index"
+        // and some of the six may be *alternate* variations that are meant to
+        // stay unloaded. Forcing all of them could double up geometry. The
+        // names are logged first so we can be selective if that happens, and
+        // DN_NO_FORCELEVELS=1 turns the forcing off while keeping the logging.
+        //
+        // TRIED AND REVERTED 2026-08-02: forcing the unloaded ones in made the
+        // map visibly worse, and the names show why. The 22 sublevels include
+        // mutually exclusive variants and non-gameplay layers:
+        //   MP_Amirani_Light      vs  MP_Amirani_Light02      (two lighting sets)
+        //   MP_Amirani_VFX_VAR00  vs  MP_Amirani_VFX_VAR01    (two VFX variants)
+        //   MP_Amirani_INTRO      vs  MP_Amirani_INTRO02
+        //   MP_Amirani_DebugCombat                            (debug layer)
+        //   MP_Amirani_Onslaught                              (other game mode)
+        // Loading all 22 stacks both lighting sets and both VFX variants on top
+        // of each other, which flattened the backdrop instead of filling in the
+        // sky. The engine's own choice of 16 is correct.
+        //
+        // It also disproves the theory: every Geo/Landscape/BaseLighting level
+        // was already loading, so the black sky is NOT unloaded geometry. Look
+        // at the orbit backdrop system instead (AYOrbitTransitionManager,
+        // "Level Variation Index"), which is the thing that never initialises
+        // offline. Opt in with DN_FORCE_LEVELS=1 only to re-measure.
+        if (s_diagCount <= 2) {
+          static std::string s_doForce = BisectGetEnv("DN_FORCE_LEVELS");
+          bool force = (s_doForce == "1");
+          for (int i = 0; i < sls.Count() && i < 32; ++i) {
+            ULevelStreaming *sl = sls[i];
+            if (!sl)
+              continue;
+            std::string nm;
+            FString *pf = (FString *)((uintptr_t)sl + 0x40);
+            if (pf && pf->Data() && IsWritableMemory(pf->Data(), 2))
+              nm = pf->ToString();
+            bool isLoaded = sl->IsLevelLoaded();
+            uint8_t *flags = (uint8_t *)((uintptr_t)sl + 0xB0);
+            tee_printf("[LEVELS] sl[%d] loaded=%d flags=0x%02X %s\n", i,
+                       isLoaded ? 1 : 0, *flags, nm.c_str());
+            if (force && !isLoaded && IsWritableMemory(flags, 1)) {
+              *flags |= (1 << 5) | (1 << 6); // bShouldBeLoaded|bShouldBeVisible
+              tee_printf("[LEVELS]   -> requested load (flags now 0x%02X)\n",
+                         *flags);
+            }
+          }
+        }
+      } catch (...) {
+        tee_printf("[INMATCH %d] EXCEPTION reading streaming levels\n",
+                   s_diagCount);
+      }
+
+      try {
+        UWorld *w = *UWorld::GWorld;
+        AYPlayerController *pc = nullptr;
+        if (w->OwningGameInstance && w->OwningGameInstance->LocalPlayers._count > 0 &&
+            w->OwningGameInstance->LocalPlayers[0])
+          pc = (AYPlayerController *)w->OwningGameInstance->LocalPlayers[0]
+                   ->PlayerController;
+
+        if (!pc) {
+          tee_printf("[INMATCH %d] no local PlayerController\n", s_diagCount);
+        } else {
+          uint8_t *p = (uint8_t *)pc;
+
+          // ---- Ownership: rebuild the in-match managers from player data ----
+          // The match's managers come up empty (entries=0, fleetSlots=0), which
+          // is why the picker entry has no name or icon, the ship has no
+          // weapons, and the engine's own loadout lookup finds nothing. Rather
+          // than hand-building FYLoadoutEntry records, ask the component to do
+          // what it does after a Mmogbrain player-data fetch:
+          // InitializeFromPlayerData() takes no arguments and repopulates
+          // m_loadoutEntries from the player data store, which is owned by the
+          // local player and so should outlive the travel.
+          //
+          // Run before the countdown ends, so if it works the engine's own
+          // fleet path finds a loadout and our substitution never triggers.
+          static int s_ownershipTries = 0;
+          {
+            void *fm = *(void **)(p + 0x958); // m_fleetManager
+            void *lm = fm ? *(void **)((uint8_t *)fm + 0x28) : nullptr;
+            if (!lm)
+              lm = *(void **)(p + 0x9A8); // m_loadoutManager
+            int32_t entries = 0;
+            if (lm && IsWritableMemory((uint8_t *)lm + 0x110, 4))
+              entries = *(int32_t *)((uint8_t *)lm + 0x110);
+            if (lm && entries == 0 && s_ownershipTries < 6) {
+              s_ownershipTries++;
+              int32_t slotsBefore =
+                  (fm && IsWritableMemory((uint8_t *)fm + 0x38, 4))
+                      ? *(int32_t *)((uint8_t *)fm + 0x38)
+                      : -1;
+              try {
+                ((UYLoadoutManagerComponent *)lm)->InitializeFromPlayerData();
+              } catch (...) {
+                tee_printf("[OWNERSHIP] InitializeFromPlayerData threw\n");
+              }
+              int32_t after = *(int32_t *)((uint8_t *)lm + 0x110);
+              int32_t slotsAfter =
+                  (fm && IsWritableMemory((uint8_t *)fm + 0x38, 4))
+                      ? *(int32_t *)((uint8_t *)fm + 0x38)
+                      : -1;
+              tee_printf("[OWNERSHIP] try %d: InitializeFromPlayerData "
+                         "entries %d -> %d, fleetSlots %d -> %d (lmc=%p fm=%p)\n",
+                         s_ownershipTries, entries, after, slotsBefore,
+                         slotsAfter, lm, fm);
+            } else if (entries > 0 && s_ownershipTries >= 0) {
+              static bool s_reported = false;
+              if (!s_reported) {
+                s_reported = true;
+                tee_printf("[OWNERSHIP] in-match manager now holds %d "
+                           "loadout entries\n",
+                           entries);
+              }
+            }
+          }
+
+          void *pawn = *(void **)(p + 0x3C8);         // AController::Pawn
+          void *ackPawn = *(void **)(p + 0x438);      // AcknowledgedPawn
+          void *camMgr = *(void **)(p + 0x458);       // PlayerCameraManager
+          void *viewTarget = nullptr;
+          if (camMgr && IsWritableMemory((uint8_t *)camMgr + 0xBF0, 8))
+            viewTarget = *(void **)((uint8_t *)camMgr + 0xBF0);
+
+          std::string pawnName = "(null)", vtName = "(null)";
+          if (pawn) {
+            try { pawnName = ((UObject *)pawn)->GetFullName(); } catch (...) {}
+          }
+          if (viewTarget) {
+            try { vtName = ((UObject *)viewTarget)->GetFullName(); } catch (...) {}
+          }
+
+          tee_printf("[INMATCH %d] pc=%p Pawn=%p AckPawn=%p camMgr=%p "
+                     "viewTarget=%p\n",
+                     s_diagCount, (void *)pc, pawn, ackPawn, camMgr, viewTarget);
+          // A visible cursor in a match means input is still routed to the UI,
+          // which is what makes WASD do nothing. bShowMouseCursor is bit 0 of
+          // the bitfield at 0x5C8; log the whole byte so a wrong bit guess is
+          // obvious rather than silently misreported.
+          tee_printf("[INMATCH %d]   inputFlags@0x5C8=0x%02X (bit0 "
+                     "bShowMouseCursor)\n",
+                     s_diagCount, *(uint8_t *)(p + 0x5C8));
+          tee_printf("[INMATCH %d]   Pawn=%s\n", s_diagCount, pawnName.c_str());
+          tee_printf("[INMATCH %d]   ViewTarget=%s\n", s_diagCount,
+                     vtName.c_str());
+
+          // Possession, AcknowledgedPawn and the view target are all correct
+          // and the screen is still black, so the remaining question is where
+          // any of this actually is. A pawn at the origin or buried inside
+          // terrain puts the chase camera inside geometry, which renders black
+          // while the world ticks and its ambient audio keeps playing.
+          if (pawn) {
+            uint8_t *pp = (uint8_t *)pawn;
+            void *root = *(void **)(pp + 0x198); // AActor::RootComponent
+            float px = 0, py = 0, pz = 0;
+            if (root && IsWritableMemory((uint8_t *)root + 0x1A0, 12)) {
+              px = *(float *)((uint8_t *)root + 0x1A0);
+              py = *(float *)((uint8_t *)root + 0x1A4);
+              pz = *(float *)((uint8_t *)root + 0x1A8);
+            }
+            bool hidden = (*(uint8_t *)(pp + 0x8C) & 0x01) != 0;
+            tee_printf("[INMATCH %d]   pawnPos=(%.0f, %.0f, %.0f) root=%p "
+                       "hidden=%d\n",
+                       s_diagCount, px, py, pz, root, hidden ? 1 : 0);
+
+            // Everything the engine needs is correct - pawn spawned, possessed,
+            // unhidden, at real map coordinates, camera framing it - and the
+            // scene is still black while Scaleform UI (the version string) and
+            // the pause menu draw fine on top. A camera fade left over from the
+            // travel produces exactly that: the scene render is blacked out but
+            // everything drawn after it is untouched. Offline the match-start
+            // path that would normally clear it never runs, so clear it once
+            // through the engine's own entry point.
+            static bool s_clearedFade = false;
+            if (!s_clearedFade && camMgr) {
+              s_clearedFade = true;
+              CG::FLinearColor black{0.0f, 0.0f, 0.0f, 1.0f};
+              try {
+                ((APlayerCameraManager *)camMgr)
+                    ->SetManualCameraFade(0.0f, black, false);
+                tee_printf("[INMATCH %d]   cleared manual camera fade\n",
+                           s_diagCount);
+              } catch (...) {
+                tee_printf("[INMATCH %d]   SetManualCameraFade threw\n",
+                           s_diagCount);
+              }
+            }
+
+            // Hand control of the ship back to the player. The pawn is
+            // possessed and the cursor is released, yet input never reaches it,
+            // which is the same offline shape as everything else here: the game
+            // disables control for the pre-match/spectator phase and the
+            // server-driven call that re-enables it never arrives.
+            //
+            // DreadGame tracks spectating separately from possession
+            // (IsClientSpectating / EndClientSpectating), and UE4 gates input
+            // behind ignore-counters and a block flag on top of that. Clear all
+            // of them through the engine's own functions, once, and report
+            // whether the spectating flag actually changed.
+            static bool s_restoredInput = false;
+            if (!s_restoredInput) {
+              s_restoredInput = true;
+              AYPlayerController *ypc = (AYPlayerController *)pc;
+              try {
+                bool wasSpectating = ypc->IsClientSpectating();
+                tee_printf("[INPUT] IsClientSpectating=%d before restore\n",
+                           wasSpectating ? 1 : 0);
+                if (wasSpectating)
+                  ypc->EndClientSpectating();
+                ypc->ResetIgnoreMoveInput();
+                ypc->ResetIgnoreLookInput();
+                ypc->BlockInput(false, false);
+                tee_printf("[INPUT] restore done: IsClientSpectating=%d "
+                           "inputFlags@0x5C8=0x%02X\n",
+                           ypc->IsClientSpectating() ? 1 : 0,
+                           *(uint8_t *)(p + 0x5C8));
+              } catch (...) {
+                tee_printf("[INPUT] EXCEPTION restoring input\n");
+              }
+            }
+
+            // In-match HUD. The YHUD and its Scaleform movie both exist (they
+            // answer OnFetchCustomLoadouts) but nothing draws, and the log
+            // carries "FrontendHud is Null". Report what is actually there,
+            // then ask the movie to start - UGFxMoviePlayer::Start(bRefresh) is
+            // the engine's own entry point for bringing a Scaleform movie up.
+            //
+            // Lower confidence than the other fixes here: the HUD wants loadout
+            // data to draw weapons and abilities, and that is empty until the
+            // Mmogbrain ownership store is populated. If Start() succeeds and
+            // the HUD is still blank, that is the reason, and it is darkace's
+            // side of the split rather than ours.
+            static bool s_triedHud = false;
+            if (!s_triedHud) {
+              s_triedHud = true;
+              void *hud = *(void **)(p + 0x450); // APlayerController::MyHUD
+              void *hudMovie =
+                  (hud && IsWritableMemory((uint8_t *)hud + 0x868, 8))
+                      ? *(void **)((uint8_t *)hud + 0x868)
+                      : nullptr;
+              std::string hudName = "(null)";
+              if (hud) {
+                try { hudName = ((UObject *)hud)->GetFullName(); } catch (...) {}
+              }
+              tee_printf("[HUD] MyHUD=%p movie=%p  %s\n", hud, hudMovie,
+                         hudName.c_str());
+              // Called through ProcessEvent rather than the SDK wrapper: the
+              // ScaleformUI package is not compiled into this project, so
+              // UGFxMoviePlayer::Start does not link.
+              if (hudMovie && pProcessEvent_Original) {
+                UFunction *startFn = (UFunction *)GetObjByName(
+                    "Function ScaleformUI.GFxMoviePlayer.Start");
+                if (!startFn) {
+                  tee_printf("[HUD] GFxMoviePlayer.Start not found\n");
+                } else {
+                  struct {
+                    bool bRefresh;
+                    bool ReturnValue;
+                  } sp{false, false};
+                  try {
+                    pProcessEvent_Original((UObject *)hudMovie, startFn, &sp);
+                    tee_printf("[HUD] Start(false) returned %d\n",
+                               sp.ReturnValue ? 1 : 0);
+                  } catch (...) {
+                    tee_printf("[HUD] Start() threw\n");
+                  }
+                }
+              }
+            }
+          }
+          // FTViewTarget lives at camMgr+0xBF0; its POV (FMinimalViewInfo)
+          // starts 8 bytes in, with Location first and FOV after the rotation.
+          if (camMgr && IsWritableMemory((uint8_t *)camMgr + 0xBF8, 32)) {
+            float *pov = (float *)((uint8_t *)camMgr + 0xBF8);
+            tee_printf("[INMATCH %d]   camPos=(%.0f, %.0f, %.0f) rot=(%.0f, "
+                       "%.0f, %.0f) fov=%.1f\n",
+                       s_diagCount, pov[0], pov[1], pov[2], pov[3], pov[4],
+                       pov[5], pov[6]);
+          }
+
+          // SpawnDefaultPawn built a real ship (observed as
+          // VH_DreadM_Pawn_T1_BP_C in the persistent level) but the controller
+          // was never given it - Pawn and AcknowledgedPawn both stay null and
+          // the camera stays on the spectator orbit cam. Hand it over through
+          // the engine's own Controller::Possess rather than writing the Pawn
+          // field, so PossessedBy/Restart/camera all run as the engine intends.
+          // Deferred to the tick instead of done inside the spawn hook to avoid
+          // re-entering the spawn path mid-call.
+          if (!pawn && g_pendingPossessPawn && g_possessAttempts < 3) {
+            g_possessAttempts++;
+            tee_printf("[INMATCH %d] pawn %p is orphaned; calling Possess "
+                       "(attempt %d)\n",
+                       s_diagCount, g_pendingPossessPawn, g_possessAttempts);
+            try {
+              ((AController *)pc)->Possess((APawn *)g_pendingPossessPawn);
+              void *nowPawn = *(void **)(p + 0x3C8);
+              tee_printf("[INMATCH %d]   after Possess: pc->Pawn=%p\n",
+                         s_diagCount, nowPawn);
+            } catch (...) {
+              tee_printf("[INMATCH %d]   Possess threw\n", s_diagCount);
+            }
+          }
+        }
+      } catch (...) {
+        tee_printf("[INMATCH %d] EXCEPTION reading controller state\n",
+                   s_diagCount);
+      }
+    }
+  }
+
+  // ----------------------------------------------------
   // PREVIEW SHIP ANIMATION BLUEPRINT INSTANTIATION
   // ----------------------------------------------------
-  if (*UWorld::GWorld) {
+  if (!g_matchTravelIssued && *UWorld::GWorld) {
     static int previewCheckFrame = 0;
     previewCheckFrame++;
 
@@ -9049,7 +9874,7 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
   }
 
   if (g_waitingForFinalization) {
-    if (*UWorld::GWorld) {
+    if (!g_matchTravelIssued && *UWorld::GWorld) {
       UWorld *world = *UWorld::GWorld;
       TArray<ULevelStreaming *> &streamingLevels = world->StreamingLevels;
 
@@ -9166,7 +9991,7 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
 
   static int frameCounter = 0;
   if (++frameCounter % 300 == 0) { // Every ~5 seconds at 60fps
-    if (*UWorld::GWorld) {
+    if (!g_matchTravelIssued && *UWorld::GWorld) {
       UWorld *world = *UWorld::GWorld;
       printf("[DIAG] GWorld: %p, PersistentLevel: %p, AuthorityGameMode: %p\n",
              world, world->PersistentLevel, world->AuthorityGameMode);
@@ -9295,7 +10120,7 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
   // ----------------------------------------------------
   // HANGAR LEVEL SCRIPT INITIALIZATION (Trigger & Fallback)
   // ----------------------------------------------------
-  if (*UWorld::GWorld) {
+  if (!g_matchTravelIssued && *UWorld::GWorld) {
     UWorld *world = *UWorld::GWorld;
     bool onHangarMap = false;
     if (world->PersistentLevel) {
@@ -9378,7 +10203,7 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
   // ----------------------------------------------------
   // CAMERA FORCE / FADE OVERRIDE PASS (Runs every frame)
   // ----------------------------------------------------
-  if (*UWorld::GWorld) {
+  if (!g_matchTravelIssued && *UWorld::GWorld) {
     UWorld *world = *UWorld::GWorld;
     if (world->OwningGameInstance &&
         world->OwningGameInstance->LocalPlayers.Count() > 0) {
@@ -9670,17 +10495,17 @@ void InitWinHttpHooks() {
   void *pSendReq = GetProcAddress(hWinHttp, "WinHttpSendRequest");
 
   if (pConnect) {
-    MH_CreateHook(pConnect, (void *)HookWinHttpConnect,
+    MH_CreateHookGated(pConnect, (void *)HookWinHttpConnect,
                   (void **)&OrigWinHttpConnect);
     MH_EnableHook(pConnect);
   }
   if (pOpenReq) {
-    MH_CreateHook(pOpenReq, (void *)HookWinHttpOpenRequest,
+    MH_CreateHookGated(pOpenReq, (void *)HookWinHttpOpenRequest,
                   (void **)&OrigWinHttpOpenRequest);
     MH_EnableHook(pOpenReq);
   }
   if (pSendReq) {
-    MH_CreateHook(pSendReq, (void *)HookWinHttpSendRequest,
+    MH_CreateHookGated(pSendReq, (void *)HookWinHttpSendRequest,
                   (void **)&OrigWinHttpSendRequest);
     MH_EnableHook(pSendReq);
   }
@@ -10026,7 +10851,7 @@ void InitGatewayHook() {
   }
 
   MH_STATUS status =
-      MH_CreateHook(pGetCommandLineW, (void *)HookGetCommandLineW,
+      MH_CreateHookGated(pGetCommandLineW, (void *)HookGetCommandLineW,
                     (void **)&OrigGetCommandLineW);
   if (status != MH_OK) {
     std::cout << "[GATEWAY] ERROR: MH_CreateHook failed for GetCommandLineW: "
@@ -11195,14 +12020,31 @@ uint64_t __fastcall MyHookRemoveLoadoutFromFleet(void *fleetMgr,
 // it also kicked off a detached post-launch setup thread that faulted in a
 // loop walking a null-based structure. Travel only here.
 static void *OrigYMenuStartMatchmaking = nullptr;
-static const wchar_t *kDefaultMatchMap = L"/Game/Maps/MP/Amirani/MP_Amirani_P";
+// Fallback map for entry points that hand us no path. Amirani is the safe
+// default: it is the map the headless harness exercises, so it is the one
+// configuration we have direct evidence loads.
+//
+// This briefly pointed at the tutorial map as a diagnostic, to answer "does
+// travel work at all" while every MP_Amirani_P attempt died on
+//
+//   GameState_TDM_BP_C ... failed to route PostInitializeComponents
+//
+// The tutorial asserted identically, which ruled out the map and the game mode.
+// The cause is still open: measured over six runs per configuration, the
+// unmodified exe hosts these maps 6/6 while the injected build manages 1/6, so
+// it is an intermittent race the mod introduces rather than anything
+// map-specific. See the retraction on g_techStateHookAddr. The diagnostic is
+// over either way, so this points at a real map again.
+static const wchar_t *kDefaultMatchMap =
+    L"/Game/Maps/MP/Amirani/MP_Amirani_P";
 
 // Shared local-launch. `path` may be empty, in which case the default map is
 // used - most entry points do not hand us one.
 //
 // Guarded so that two entry points firing for a single click (or a queue that
-// retries) cannot issue two travels.
-static bool g_matchTravelIssued = false;
+// retries) cannot issue two travels. g_matchTravelIssued is declared near the
+// top of the file because UGameEngineTick's frontend passes read it too - see
+// the comment there for why they must stop once we leave the hangar.
 
 static void TravelToMatchMap(const std::wstring &pathIn, const wchar_t *why) {
   std::wstring path = pathIn;
@@ -11218,9 +12060,25 @@ static void TravelToMatchMap(const std::wstring &pathIn, const wchar_t *why) {
   }
   g_matchTravelIssued = true;
 
-  // ?Listen so the travel stands up a listen server locally; without it the
-  // client has nothing to connect to and bounces straight back.
-  std::wstring url = path + L"?Listen";
+  // Standalone, NOT ?Listen.
+  //
+  // ?Listen asks for a networked listen server, and that is a configuration
+  // neither the original game nor upstream ever runs from the frontend: the
+  // retail client always connected out to a Mmogbrain-assigned server, and
+  // gwog's build only hosts from his headless server target, at startup, with
+  // GIsServer already set and the frontend never loaded. Hosting from a live
+  // hangar is a path nothing has exercised.
+  //
+  // It also matches the observed failure. With ?Listen the map loads and then
+  // the engine asserts in Actor.cpp:2979 - "GameState_TDM_BP_C failed to route
+  // PostInitializeComponents" - which is the game state's init chain not
+  // completing, exactly the sort of thing net authority setup governs.
+  //
+  // Plain "open MP_Amirani_P" is known to travel cleanly here: upstream's
+  // Launch Singleplayer used it, and that button's crash was traced to its
+  // post-launch bot-setup thread, never to the travel. Standalone still gives
+  // us an authoritative GameMode and GameState, which is all a bot match needs.
+  std::wstring url = path;
   tee_printf("[MATCH] %ls -> traveling to '%ls'\n", why, url.c_str());
 
   ProcInMainThread([url]() {
@@ -11229,6 +12087,25 @@ static void TravelToMatchMap(const std::wstring &pathIn, const wchar_t *why) {
       g_matchTravelIssued = false;
       return;
     }
+
+    // Hand back everything we wired into the engine by hand before the world
+    // is torn down. Both of these are safe in the hangar and unsafe across a
+    // level load: the alias double-frees refcounted members, and the TTM
+    // arrays make the collector abandon a token stream mid-object right when
+    // LoadMap depends on it tracing correctly.
+    UnaliasGameModeArrays();
+    UnwireTechTreeManager();
+
+    // Lift the 0x53C870 patch. This is a precaution, not a proven fix - see
+    // the retraction on g_techStateHookAddr. The hook only serves the tech tree
+    // and purchase screens, so it has no job once we are leaving the frontend.
+    if (g_techStateHookAddr) {
+      MH_STATUS st = MH_DisableHook(g_techStateHookAddr);
+      tee_printf("[MATCH] TechTree item state hook (0x53C870) disabled before "
+                 "travel: status=%d\n",
+                 (int)st);
+    }
+
     FString travelUrl = url.c_str();
     reinterpret_cast<void (*)(UWorld *, FString *, bool, bool)>(
         Globals::ModuleBase + 0x1CE2E40)((*UWorld::GWorld), &travelUrl, true,
@@ -11477,6 +12354,193 @@ void __fastcall MyHookGetLoadoutForShipID(void *lmc, int32_t shipID,
                shipID, outCount, entryCount);
 }
 
+// ---------------------------------------------------------------------------
+// In-match ship spawn: supply a loadout when no server can.
+//
+// AYGameMode::SpawnDefaultPawn (verified .pdata entry 0x382530-0x382603) takes
+// the loadout as a *parameter* and bails immediately with
+//   "AYGameMode::SpawnDefaultPawn: Active Loadout not found. Can't spawn"
+// when it is null. It never consults m_activeLoadout itself, so hooking it
+// would be hooking the messenger. The parameter is produced by RVA 0x370970,
+// which both of its callers (0x3827D0 and 0x382870) route through:
+//
+//   loadoutA = GameMode->vtable[0x880](pc);   // server-assigned loadout
+//   lmc      = pc->m_fleetManager(+0x958)->m_loadoutManagerComponent(+0x28);
+//   current  = lmc->m_activeLoadout(+0x208);
+//   if (loadoutA && lmc) { AddAndActivateLoadout(lmc, loadoutA); return loadoutA; }
+//   if (!current && lmc && pc->m_fleetManager) {
+//       u = FUN_140346240(fleetMgr, wantedName);   // match against fleet slots
+//       ActivateLoadout(lmc, u, true);             // u == null -> "Loadout nullptr"
+//       current = lmc->m_activeLoadout;
+//   }
+//   return current;
+//
+// Offline the first source is null because nothing replicates a loadout, and
+// the second is null because FUN_140346240 matches an FName against the fleet
+// slot array (fleetMgr+0x30, count +0x38, stride 0x50) which the match's fresh
+// fleet manager has not been given. The observed log proves both fleetMgr and
+// lmc are non-null in-match - the fallback path ran and only the lookup failed.
+//
+// Hooking 0x370970 covers both callers at one choke point and, critically,
+// leaves the engine's own path untouched whenever it does produce a loadout.
+// That is what makes it safe to leave enabled once a real server starts
+// supplying one: this only ever fills a hole, it never overrides.
+static void *OrigGetLoadoutForSpawn = nullptr;
+
+// UYLoadoutManagerComponent::ActivateLoadout, verified entry 0x336C90.
+typedef void(__fastcall *tActivateLoadoutRaw)(void *lmc, void *loadout,
+                                              bool assetLoad);
+// UYLoadoutManagerComponent::AddAndActivateLoadout, verified entry 0x337450.
+// Registers the loadout in m_loadoutEntries with type 2, which matters because
+// the validity gate FUN_14033c680 rejects loadouts recorded as type 4.
+typedef void(__fastcall *tAddAndActivateLoadoutRaw)(void *lmc, void *loadout);
+
+// Kept in its own function so the __try does not sit in a scope holding objects
+// that need unwinding (MSVC C2712).
+static bool ActivateLoadoutGuarded(void *lmc, void *loadout) {
+  __try {
+    ((tAddAndActivateLoadoutRaw)(Globals::ModuleBase + 0x337450))(lmc, loadout);
+    ((tActivateLoadoutRaw)(Globals::ModuleBase + 0x336C90))(lmc, loadout, true);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+// Pure observer on AYGameMode::SpawnDefaultPawn (verified entry 0x382530).
+// The loadout fix removed its "Can't spawn" bail-out, but a spawn that does not
+// error is not the same as a pawn the player can see - this reports what the
+// function actually handed back. Read-only: it forwards every argument through
+// untouched and returns the engine's own result.
+static void *OrigSpawnDefaultPawn = nullptr;
+
+void *__fastcall MyHookSpawnDefaultPawn(void *gameMode, void *pc, void *loadout,
+                                        void *rot, void *loc) {
+  typedef void *(__fastcall * OrigFn)(void *, void *, void *, void *, void *);
+  void *pawn = OrigSpawnDefaultPawn
+                   ? ((OrigFn)OrigSpawnDefaultPawn)(gameMode, pc, loadout, rot,
+                                                    loc)
+                   : nullptr;
+  static int s_n = 0;
+  if (s_n++ < 6) {
+    std::string cls = "?";
+    if (pawn) {
+      try {
+        cls = ((UObject *)pawn)->GetFullName();
+      } catch (...) {
+        cls = "(name threw)";
+      }
+    }
+    tee_printf("[SPAWN] SpawnDefaultPawn(pc=%p loadout=%p) -> pawn=%p %s\n", pc,
+               loadout, pawn, pawn ? cls.c_str() : "(NULL)");
+
+    // Which GameMode virtual was supposed to hand the pawn to the controller,
+    // and did it? vtable[0x888] is the (gameMode, pc, pawn) call at the tail of
+    // SpawnDefaultPawn; naming its RVA tells us what to read next if Possess
+    // turns out not to be the right lever.
+    if (pawn && pc) {
+      uint8_t *p = (uint8_t *)pc;
+      void *curPawn = *(void **)(p + 0x3C8);
+      void *pawnCtrl = *(void **)((uint8_t *)pawn + 0x3F8);
+      uint32_t vfnRva = 0;
+      void **vtbl = *(void ***)gameMode;
+      if (vtbl) {
+        void *vfn = vtbl[0x888 / 8];
+        if ((uintptr_t)vfn > Globals::ModuleBase)
+          vfnRva = (uint32_t)((uintptr_t)vfn - Globals::ModuleBase);
+      }
+      tee_printf("[SPAWN]   after: pc->Pawn=%p pawn->Controller=%p pcRole=%d "
+                 "pawnRole=%d gmVtbl[0x888]=RVA 0x%X\n",
+                 curPawn, pawnCtrl, (int)*(uint8_t *)(p + 0x148),
+                 (int)*(uint8_t *)((uint8_t *)pawn + 0x148), vfnRva);
+    }
+  }
+  // Remember it even past the log cap; the tick retries possession if the
+  // engine leaves the controller without a pawn.
+  if (pawn && pc && !*(void **)((uint8_t *)pc + 0x3C8))
+    g_pendingPossessPawn = pawn;
+  return pawn;
+}
+
+void *__fastcall MyHookGetLoadoutForSpawn(void *gameMode, void *pc) {
+  typedef void *(__fastcall * OrigFn)(void *, void *);
+  void *result = OrigGetLoadoutForSpawn
+                     ? ((OrigFn)OrigGetLoadoutForSpawn)(gameMode, pc)
+                     : nullptr;
+
+  // The engine found one. Never second-guess it.
+  if (result || !pc)
+    return result;
+
+  static int s_logCount = 0;
+  bool verbose = (s_logCount++ < 8);
+
+  void *fleetMgr = nullptr;
+  void *lmc = nullptr;
+  if (IsWritableMemory((uint8_t *)pc + 0x958, 8))
+    fleetMgr = *(void **)((uint8_t *)pc + 0x958);
+  if (fleetMgr && IsWritableMemory((uint8_t *)fleetMgr + 0x28, 8))
+    lmc = *(void **)((uint8_t *)fleetMgr + 0x28);
+
+  // Fall back to the controller's own component if the fleet manager has not
+  // been wired to one. These are usually the same object, but 0x370970 reaches
+  // it exclusively through the fleet manager, so that is the one to prefer.
+  if (!lmc && IsWritableMemory((uint8_t *)pc + 0x9A8, 8))
+    lmc = *(void **)((uint8_t *)pc + 0x9A8);
+
+  if (verbose) {
+    int32_t entryCount = -1, slotCount = -1;
+    void *filter = nullptr;
+    if (lmc && IsWritableMemory((uint8_t *)lmc + 0x108, 16)) {
+      entryCount = *(int32_t *)((uint8_t *)lmc + 0x110);
+      filter = *(void **)((uint8_t *)lmc + 0x200);
+    }
+    if (fleetMgr && IsWritableMemory((uint8_t *)fleetMgr + 0x30, 16))
+      slotCount = *(int32_t *)((uint8_t *)fleetMgr + 0x38);
+    tee_printf("[SPAWN] no loadout from engine: pc=%p fleetMgr=%p lmc=%p "
+               "entries=%d fleetSlots=%d filter=%p\n",
+               pc, fleetMgr, lmc, entryCount, slotCount, filter);
+  }
+
+  if (!lmc)
+    return nullptr;
+
+  // Pick the ship the player chose in the hangar; failing that, the first ship
+  // we loaded. The engine's own else-branch in FUN_140346240 does the same
+  // thing - "return the first loadout that exists" - so this is the behaviour
+  // the fallback was written to have, just with data it can actually reach.
+  UObject *chosen = g_lastActivatedLoadout;
+  if (!chosen) {
+    for (int i = 0; i < g_numLoadedShips && !chosen; i++)
+      chosen = g_loadedShips[i].loadoutObj;
+  }
+  if (!chosen) {
+    tee_printf("[SPAWN] no loadout available to substitute (loadedShips=%d)\n",
+               g_numLoadedShips);
+    return nullptr;
+  }
+
+  // Register then activate through the engine's own functions rather than
+  // writing m_activeLoadout directly, so the manager's bookkeeping, the
+  // OnActivateLoadoutAfterLoad delegate and the asset load all still happen.
+  if (!ActivateLoadoutGuarded(lmc, chosen)) {
+    tee_printf("[SPAWN] EXCEPTION activating substitute loadout %p\n", chosen);
+    return nullptr;
+  }
+
+  // Read back what the manager settled on. If ActivateLoadout accepted it,
+  // m_activeLoadout is now set and agrees with `chosen`; if the validity gate
+  // refused, returning `chosen` anyway still satisfies SpawnDefaultPawn, which
+  // only needs a loadout whose vtable[0x208] yields a ship class.
+  void *active = nullptr;
+  if (IsWritableMemory((uint8_t *)lmc + 0x208, 8))
+    active = *(void **)((uint8_t *)lmc + 0x208);
+
+  tee_printf("[SPAWN] substituted loadout %p (manager active=%p) for spawn\n",
+             (void *)chosen, active);
+  return active ? active : (void *)chosen;
+}
+
 void __fastcall MyHookGetAvailableShipsForActiveFleetType(UObject *Context,
                                                           void *Stack,
                                                           void *RESULT_DECL) {
@@ -11605,6 +12669,12 @@ void InitEarlyHooks() {
   printf("[INIT] Initializing early hooks (Auth, EAC, Engine)...\n");
   MH_Initialize();
 
+  if (ForceTraveledFromEnv()) {
+    g_matchTravelIssued = true;
+    printf("[INIT] DN_FORCE_TRAVELED=1 - starting as if travel was already "
+           "issued; frontend tick passes are off.\n");
+  }
+
   // Owned-ships hooks. Previously installed by MinHook on RVAs 0xBB9530 /
   // 0xBB95E0 with a plain member-function signature. Ghidra proved those are
   // UFunction exec thunks, not implementations (registrar FUN_140b057d0 maps
@@ -11622,7 +12692,7 @@ void InitEarlyHooks() {
   // cache IDs. See MyHookFindTechTreeEntry.
   {
     void *findAddr = (void *)(Globals::ModuleBase + 0x003F51A0);
-    if (MH_CreateHook(findAddr, &MyHookFindTechTreeEntry,
+    if (MH_CreateHookGated(findAddr, &MyHookFindTechTreeEntry,
                       reinterpret_cast<void **>(&OrigFindTechTreeEntry)) == MH_OK) {
       MH_EnableHook(findAddr);
       tee_printf("[HOOK] TechTree entry lookup hooked at RVA 0x3F51A0\n");
@@ -11637,7 +12707,7 @@ void InitEarlyHooks() {
   // not optional.
   {
     void *addLoadoutAddr = (void *)(Globals::ModuleBase + 0x00ABF150);
-    if (MH_CreateHook(addLoadoutAddr, &MyHookScreenAddLoadoutToFleet,
+    if (MH_CreateHookGated(addLoadoutAddr, &MyHookScreenAddLoadoutToFleet,
                       reinterpret_cast<void **>(&OrigScreenAddLoadoutToFleet)) ==
         MH_OK) {
       MH_EnableHook(addLoadoutAddr);
@@ -11649,7 +12719,7 @@ void InitEarlyHooks() {
     }
 
     void *removeBodyAddr = (void *)(Globals::ModuleBase + 0x00ADBBA0);
-    if (MH_CreateHook(removeBodyAddr, &MyHookScreenRemoveShipBody,
+    if (MH_CreateHookGated(removeBodyAddr, &MyHookScreenRemoveShipBody,
                       reinterpret_cast<void **>(&OrigScreenRemoveShipBody)) ==
         MH_OK) {
       MH_EnableHook(removeBodyAddr);
@@ -11658,7 +12728,7 @@ void InitEarlyHooks() {
     }
 
     void *loadoutFindAddr = (void *)(Globals::ModuleBase + 0x0033FED0);
-    if (MH_CreateHook(loadoutFindAddr, &MyHookFindLoadoutsForShip,
+    if (MH_CreateHookGated(loadoutFindAddr, &MyHookFindLoadoutsForShip,
                       reinterpret_cast<void **>(&OrigFindLoadoutsForShip)) ==
         MH_OK) {
       MH_EnableHook(loadoutFindAddr);
@@ -11667,7 +12737,7 @@ void InitEarlyHooks() {
     }
 
     void *fleetCountAddr = (void *)(Globals::ModuleBase + 0x003467F0);
-    if (MH_CreateHook(fleetCountAddr, &MyHookGetFleetShipCount,
+    if (MH_CreateHookGated(fleetCountAddr, &MyHookGetFleetShipCount,
                       reinterpret_cast<void **>(&OrigGetFleetShipCount)) ==
         MH_OK) {
       MH_EnableHook(fleetCountAddr);
@@ -11679,7 +12749,7 @@ void InitEarlyHooks() {
     // is how a hook can be reported "installed" while never firing.
     {
       void *removeAddr = (void *)(Globals::ModuleBase + 0x00359B50);
-      MH_STATUS cs = MH_CreateHook(
+      MH_STATUS cs = MH_CreateHookGated(
           removeAddr, &MyHookRemoveLoadoutFromFleet,
           reinterpret_cast<void **>(&OrigRemoveLoadoutFromFleet));
       MH_STATUS es = (cs == MH_OK) ? MH_EnableHook(removeAddr) : cs;
@@ -11689,7 +12759,7 @@ void InitEarlyHooks() {
     }
 
     void *startMmAddr = (void *)(Globals::ModuleBase + 0x004D18D0);
-    if (MH_CreateHook(startMmAddr, &MyHookYMenuStartMatchmaking,
+    if (MH_CreateHookGated(startMmAddr, &MyHookYMenuStartMatchmaking,
                       reinterpret_cast<void **>(&OrigYMenuStartMatchmaking)) ==
         MH_OK) {
       MH_STATUS es = MH_EnableHook(startMmAddr);
@@ -11702,7 +12772,7 @@ void InitEarlyHooks() {
     }
 
     void *classifyAddr = (void *)(Globals::ModuleBase + 0x00541CD0);
-    if (MH_CreateHook(classifyAddr, &MyHookClassifyLoadoutItemType,
+    if (MH_CreateHookGated(classifyAddr, &MyHookClassifyLoadoutItemType,
                       reinterpret_cast<void **>(&OrigClassifyLoadoutItemType)) ==
         MH_OK) {
       MH_STATUS es = MH_EnableHook(classifyAddr);
@@ -11715,7 +12785,7 @@ void InitEarlyHooks() {
     }
 
     void *techTreeLookupAddr = (void *)(Globals::ModuleBase + 0x003F5050);
-    if (MH_CreateHook(techTreeLookupAddr, &MyHookFindShipTechTreeData,
+    if (MH_CreateHookGated(techTreeLookupAddr, &MyHookFindShipTechTreeData,
                       reinterpret_cast<void **>(&OrigFindShipTechTreeData)) ==
         MH_OK) {
       MH_EnableHook(techTreeLookupAddr);
@@ -11726,8 +12796,36 @@ void InitEarlyHooks() {
                  "0x3F5050\n");
     }
 
+    // Read-only observer, verified .pdata entry 0x382530-0x382603.
+    if (BisectGetEnv("DN_NO_SPAWNFIX") != "1") {
+      void *spawnPawnAddr = (void *)(Globals::ModuleBase + 0x00382530);
+      if (MH_CreateHookGated(spawnPawnAddr, &MyHookSpawnDefaultPawn,
+                        reinterpret_cast<void **>(&OrigSpawnDefaultPawn)) ==
+          MH_OK) {
+        MH_EnableHook(spawnPawnAddr);
+        tee_printf("[HOOK] GameMode::SpawnDefaultPawn observed at RVA "
+                   "0x382530\n");
+      }
+    }
+
+    // Verified .pdata entry 0x370970-0x370A1D. See MyHookGetLoadoutForSpawn
+    // for why this and not SpawnDefaultPawn itself. Off with DN_NO_SPAWNFIX=1.
+    if (BisectGetEnv("DN_NO_SPAWNFIX") != "1") {
+      void *spawnLoadoutAddr = (void *)(Globals::ModuleBase + 0x00370970);
+      if (MH_CreateHookGated(spawnLoadoutAddr, &MyHookGetLoadoutForSpawn,
+                        reinterpret_cast<void **>(&OrigGetLoadoutForSpawn)) ==
+          MH_OK) {
+        MH_EnableHook(spawnLoadoutAddr);
+        tee_printf("[HOOK] GameMode::GetLoadoutForSpawn hooked at RVA "
+                   "0x370970\n");
+      } else {
+        tee_printf("[HOOK] WARNING: failed to hook GetLoadoutForSpawn at RVA "
+                   "0x370970\n");
+      }
+    }
+
     void *loadoutLookupAddr = (void *)(Globals::ModuleBase + 0x00340950);
-    if (MH_CreateHook(loadoutLookupAddr, &MyHookGetLoadoutForShipID,
+    if (MH_CreateHookGated(loadoutLookupAddr, &MyHookGetLoadoutForShipID,
                       reinterpret_cast<void **>(&OrigGetLoadoutForShipID)) ==
         MH_OK) {
       MH_EnableHook(loadoutLookupAddr);
@@ -11743,7 +12841,7 @@ void InitEarlyHooks() {
   // prerequisite evaluation work offline Ã¢â‚¬â€ see MyHookHasResearchedScan.
   {
     void *researchedAddr = (void *)(Globals::ModuleBase + 0x00547DD0);
-    if (MH_CreateHook(researchedAddr, &MyHookHasResearchedScan,
+    if (MH_CreateHookGated(researchedAddr, &MyHookHasResearchedScan,
                       reinterpret_cast<void **>(&OrigHasResearchedScan)) == MH_OK) {
       MH_EnableHook(researchedAddr);
       tee_printf("[HOOK] HasResearched entitlement scan hooked at RVA 0x547DD0\n");
@@ -11752,7 +12850,7 @@ void InitEarlyHooks() {
     }
 
     void *purchasedAddr = (void *)(Globals::ModuleBase + 0x00548990);
-    if (MH_CreateHook(purchasedAddr, &MyHookHasPurchasedScan,
+    if (MH_CreateHookGated(purchasedAddr, &MyHookHasPurchasedScan,
                       reinterpret_cast<void **>(&OrigHasPurchasedScan)) == MH_OK) {
       MH_EnableHook(purchasedAddr);
       tee_printf("[HOOK] HasPurchased entitlement scan hooked at RVA 0x548990\n");
@@ -11766,9 +12864,10 @@ void InitEarlyHooks() {
   // native UFunction, so MinHook with register params is correct here.
   {
     void *stateAddr = (void *)(Globals::ModuleBase + 0x0053C870);
-    if (MH_CreateHook(stateAddr, &MyHookResolveTechTreeItemState,
+    if (MH_CreateHookGated(stateAddr, &MyHookResolveTechTreeItemState,
                       reinterpret_cast<void **>(&OrigResolveTechTreeItemState)) == MH_OK) {
       MH_EnableHook(stateAddr);
+      g_techStateHookAddr = stateAddr;
       tee_printf("[HOOK] TechTree item state resolver hooked at RVA 0x53C870\n");
     } else {
       tee_printf("[HOOK] WARNING: failed to hook item state resolver at RVA 0x53C870\n");
@@ -11790,9 +12889,23 @@ void InitEarlyHooks() {
 
   // Install VEH to prevent background-thread crashes from killing the game
   g_mainThreadId = GetCurrentThreadId();
-  AddVectoredExceptionHandler(1, BackgroundThreadVEH); // 1 = first handler
-  printf("[INIT] Background thread crash handler installed (main thread=%u)\n",
-         g_mainThreadId);
+  // DN_NO_VEH=1 skips this. The handler forces a fake "return 0" out of any
+  // DEP-execute fault on a background thread by rewriting Rip/Rsp/Rax, which
+  // is invasive enough to be a prime suspect for the intermittent map-load
+  // failure - async loading runs on exactly those threads.
+  {
+    char b[8];
+    DWORD n = GetEnvironmentVariableA("DN_NO_VEH", b, sizeof(b));
+    if (n == 1 && b[0] == '1') {
+      printf("[INIT] DN_NO_VEH=1 - background thread crash handler NOT "
+             "installed.\n");
+    } else {
+      AddVectoredExceptionHandler(1, BackgroundThreadVEH); // 1 = first handler
+      printf(
+          "[INIT] Background thread crash handler installed (main thread=%u)\n",
+          g_mainThreadId);
+    }
+  }
 
   // IMMEDIATELY patch ALL WebServicesPlugin timer-scheduling functions.
   // The WebServicesPlugin has ~10 scheduler functions (touch session, ping,
@@ -11800,7 +12913,22 @@ void InitEarlyHooks() {
   // (FUN_141c8f760). When any timer fires on TaskGraphThread, it accesses dead
   // web service objects Ã¢â€ â€™ crash. Patching all of them with RET (0xC3)
   // prevents ANY timer from being scheduled.
-  {
+  // DN_NO_PATCHES=1 skips every byte patch applied here (the WebServicesPlugin
+  // timer RETs and the GC token patch), leaving only the MinHook hooks.
+  char npBuf[8];
+  DWORD npLen = GetEnvironmentVariableA("DN_NO_PATCHES", npBuf, sizeof(npBuf));
+  const bool skipPatches = (npLen == 1 && npBuf[0] == '1');
+  if (skipPatches)
+    printf("[INIT] DN_NO_PATCHES=1 - skipping all byte patches.\n");
+
+  // DN_LEGACY_TIMER_RETS=1 restores the old RET-stamping for comparison. It is
+  // off by default now - see MyHookSetTimer for why.
+  char ltrBuf[8];
+  DWORD ltrLen =
+      GetEnvironmentVariableA("DN_LEGACY_TIMER_RETS", ltrBuf, sizeof(ltrBuf));
+  const bool useLegacyRets = (ltrLen == 1 && ltrBuf[0] == '1');
+
+  if (useLegacyRets && !skipPatches) {
     uintptr_t base =
         (uintptr_t)GetModuleHandleA("DreadGame-Win64-Shipping.exe");
     if (base) {
@@ -11828,8 +12956,51 @@ void InitEarlyHooks() {
       const int NUM_TIMERS = sizeof(timerRVAs) / sizeof(timerRVAs[0]);
       uint8_t ret = 0xC3;
       int ok = 0;
+
+      // DN_NO_SETTIMER=1 leaves FTimerManager::SetTimer (0x1C8F760) alone.
+      // RET-ing that disables EVERY timer in the engine, not just the dead
+      // WebServicesPlugin ones - and GameMode/GameState drive their startup
+      // match-state transitions off timers.
+      char stBuf[8];
+      DWORD stLen = GetEnvironmentVariableA("DN_NO_SETTIMER", stBuf, sizeof(stBuf));
+      bool skipSetTimer = (stLen == 1 && stBuf[0] == '1');
+
+      int rejected = 0;
       for (int i = 0; i < NUM_TIMERS; i++) {
         DWORD oldProt;
+        if (skipSetTimer && timerRVAs[i] == 0x1C8F760) {
+          printf("[INIT] DN_NO_SETTIMER=1 - leaving FTimerManager::SetTimer "
+                 "unpatched.\n");
+          continue;
+        }
+
+        // Refuse to stamp RET anywhere that is not plausibly a function entry.
+        //
+        // These RVAs were originally found by "scanning for SetTimer calls in
+        // the WebServicesPlugin range", which yields the address of the CALL,
+        // not of the enclosing function. Six of the thirteen were mid-body -
+        // 0x39CFD5 landed inside a LEA's displacement bytes. Writing 0xC3 there
+        // truncates a live function at an arbitrary point or corrupts the
+        // instruction stream outright, which is what made map loads fail
+        // intermittently (6/6 clean with all patches off, 1/6 with them on).
+        //
+        // .pdata is authoritative; byte heuristics are not. Of the thirteen
+        // RVAs below, six are mid-function and one (0x38ED50) is not inside any
+        // function at all.
+        uint32_t entry = ResolveFunctionEntry(timerRVAs[i]);
+        if (entry != timerRVAs[i]) {
+          if (entry)
+            printf("[INIT] REJECTED timer patch at RVA 0x%X - mid-function, "
+                   "real entry is 0x%X (+0x%X)\n",
+                   timerRVAs[i], entry, timerRVAs[i] - entry);
+          else
+            printf("[INIT] REJECTED timer patch at RVA 0x%X - not inside any "
+                   "function\n",
+                   timerRVAs[i]);
+          rejected++;
+          continue;
+        }
+
         void *addr = (void *)(base + timerRVAs[i]);
         if (VirtualProtect(addr, 1, PAGE_EXECUTE_READWRITE, &oldProt)) {
           *(uint8_t *)addr = ret;
@@ -11838,18 +13009,62 @@ void InitEarlyHooks() {
         }
       }
       printf("[INIT] Early-patched %d/%d WebServicesPlugin timer functions "
-             "(RET)\n",
-             ok, NUM_TIMERS);
+             "(RET), %d rejected as not function entries\n",
+             ok, NUM_TIMERS, rejected);
+    }
+  }
+
+  // The real fix: build the scheduler ranges and filter SetTimer.
+  if (!skipPatches) {
+    static const uint32_t schedulerRVAs[] = {
+        0x382ED0, 0x3838D9, 0x383B6B, 0x383D68, 0x3900E0, 0x39CFD5,
+        0x39D200, 0x39D32F, 0x3A2FF0, 0x3A59F0, 0x3AA880,
+    };
+    for (int i = 0; i < (int)(sizeof(schedulerRVAs) / sizeof(schedulerRVAs[0]));
+         i++) {
+      uint32_t b = 0, e = 0;
+      if (!ResolveFunctionRange(schedulerRVAs[i], &b, &e)) {
+        printf("[TIMER] 0x%X is not inside any function - skipped\n",
+               schedulerRVAs[i]);
+        continue;
+      }
+      bool dup = false;
+      for (size_t j = 0; j < g_webServiceRanges.size(); j++)
+        if (g_webServiceRanges[j].begin == b)
+          dup = true;
+      if (!dup)
+        g_webServiceRanges.push_back({b, e});
+    }
+    printf("[TIMER] %d distinct WebServicesPlugin scheduler functions "
+           "resolved from .pdata\n",
+           (int)g_webServiceRanges.size());
+
+    void *setTimerAddr = (void *)(Globals::ModuleBase + 0x1C8F760);
+    if (MH_CreateHookGated(setTimerAddr, &MyHookSetTimer,
+                           reinterpret_cast<void **>(&OrigSetTimer)) == MH_OK) {
+      MH_EnableHook(setTimerAddr);
+      tee_printf("[TIMER] FTimerManager::SetTimer filtered hook installed at "
+                 "RVA 0x1C8F760\n");
+    } else {
+      tee_printf("[TIMER] WARNING: failed to hook SetTimer at 0x1C8F760\n");
     }
   }
 
   // Patch GC "Unknown token" fatal error EARLY, before GC runs on background
-  // threads
-  PatchGCUnknownTokenCrash();
+  // threads. DN_NO_GCPATCH=1 skips just this one, leaving the timer RETs on.
+  {
+    char gcBuf[8];
+    DWORD gcLen = GetEnvironmentVariableA("DN_NO_GCPATCH", gcBuf, sizeof(gcBuf));
+    const bool skipGc = skipPatches || (gcLen == 1 && gcBuf[0] == '1');
+    if (skipGc)
+      printf("[INIT] GC token patch skipped.\n");
+    else
+      PatchGCUnknownTokenCrash();
+  }
 
   tProcessEvent hookRef = (tProcessEvent)(Globals::ModuleBase + 0xD5B180);
 
-  if (MH_CreateHook(hookRef, ProcessEventHook,
+  if (MH_CreateHookGated(hookRef, ProcessEventHook,
                     reinterpret_cast<void **>(&pProcessEvent_Original)) !=
       MH_OK) {
     printf("ProcessEvent Hook Initialization Failed!\n");
@@ -11860,36 +13075,48 @@ void InitEarlyHooks() {
     return;
   }
 
-  MH_CreateHook((void *)(Globals::ModuleBase + 0x29FD910), EACErrorMessageHook,
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0x29FD910), EACErrorMessageHook,
                 &origEACErrorMessageHook);
   MH_EnableHook((void *)(Globals::ModuleBase + 0x29FD910));
 
-  MH_CreateHook((void *)(Globals::ModuleBase + 0x1A841C0), EACErrorMessageHook,
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0x1A841C0), EACErrorMessageHook,
                 &origEACErrorMessageHook);
   MH_EnableHook((void *)(Globals::ModuleBase + 0x1A841C0));
 
-  MH_CreateHook((void *)(Globals::ModuleBase + 0x1958C90), UGameEngineTick,
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0x1958C90), UGameEngineTick,
                 &OrigUGameEngineTick);
   MH_EnableHook((void *)(Globals::ModuleBase + 0x1958C90));
 
   // Enable auth token and firmament cert hooks early to unblock web service
-  // sessions
-  MH_CreateHook((void *)(Globals::ModuleBase + 0x4201D0),
-                reinterpret_cast<LPVOID>(GetAuthTokenHook), &OrigGetAuthToken);
-  MH_EnableHook((void *)(Globals::ModuleBase + 0x4201D0));
+  // sessions.
+  //
+  // Offline only. GetAuthTokenHook replaces the session token with the literal
+  // string "0w0", which is fine when nothing checks it and fatal when something
+  // does: against a real backend every authenticated request carries "0w0" and
+  // comes back 401 ("We can't seem to authenticate you"), which is exactly what
+  // the client showed once server mode let the real login run. The firmament
+  // cert check is skipped with it, since a real server presents a real cert.
+  if (!g_serverMode) {
+    MH_CreateHookGated((void *)(Globals::ModuleBase + 0x4201D0),
+                  reinterpret_cast<LPVOID>(GetAuthTokenHook), &OrigGetAuthToken);
+    MH_EnableHook((void *)(Globals::ModuleBase + 0x4201D0));
 
-  MH_CreateHook((void *)(Globals::ModuleBase + 0x2A4D590),
-                reinterpret_cast<LPVOID>(ValidateFirmamentCertHook),
-                &OrigValidateFirmamentCert);
-  MH_EnableHook((void *)(Globals::ModuleBase + 0x2A4D590));
-  printf("[GATEWAY-AUTH] Auth token and firmament cert hooks enabled\n");
+    MH_CreateHookGated((void *)(Globals::ModuleBase + 0x2A4D590),
+                  reinterpret_cast<LPVOID>(ValidateFirmamentCertHook),
+                  &OrigValidateFirmamentCert);
+    MH_EnableHook((void *)(Globals::ModuleBase + 0x2A4D590));
+    printf("[GATEWAY-AUTH] Auth token and firmament cert hooks enabled\n");
+  } else {
+    printf("[GATEWAY-AUTH] Server mode: auth token and firmament cert hooks "
+           "DISABLED so the real session token is used.\n");
+  }
 
   // Hook YUIExternalFunctions::GetManufacturerData at known RVA 0x4ED0C0
   // (Ghidra-verified)
   void *getManufacturerDataAddr = (void *)(Globals::ModuleBase + 0x4ED0C0);
   {
     MH_STATUS status =
-        MH_CreateHook(getManufacturerDataAddr,
+        MH_CreateHookGated(getManufacturerDataAddr,
                       reinterpret_cast<LPVOID>(MyHookGetManufacturerData),
                       reinterpret_cast<void **>(&OrigGetManufacturerData));
     if (status == MH_OK) {
@@ -11928,7 +13155,7 @@ void InitEarlyHooks() {
   // != NULL)`, and local_240 comes from this.
   {
     void *findCachedAddr = (void *)(Globals::ModuleBase + 0x480F70);
-    MH_STATUS status = MH_CreateHook(
+    MH_STATUS status = MH_CreateHookGated(
         findCachedAddr, reinterpret_cast<LPVOID>(MyHookFindCachedDataEntry),
         reinterpret_cast<void **>(&OrigFindCachedDataEntry));
     if (status == MH_OK) {
@@ -11945,7 +13172,7 @@ void InitEarlyHooks() {
   // Hook FUN_1404e0520 (ItemFilter) Ã¢â‚¬â€ the per-item validation/widget-builder
   {
     void *itemFilterAddr = (void *)(Globals::ModuleBase + 0x4E0520);
-    MH_STATUS status = MH_CreateHook(
+    MH_STATUS status = MH_CreateHookGated(
         itemFilterAddr, reinterpret_cast<LPVOID>(MyHookItemFilter),
         reinterpret_cast<void **>(&OrigItemFilter));
     if (status == MH_OK) {
@@ -11962,7 +13189,7 @@ void InitEarlyHooks() {
   // (Ghidra-verified)
   {
     void *shipResearchAddr = (void *)(Globals::ModuleBase + 0x4EE820);
-    MH_STATUS status = MH_CreateHook(
+    MH_STATUS status = MH_CreateHookGated(
         shipResearchAddr, reinterpret_cast<LPVOID>(MyHookGetShipResearchData),
         reinterpret_cast<void **>(&OrigGetShipResearchData));
     if (status == MH_OK) {
@@ -11977,19 +13204,19 @@ void InitEarlyHooks() {
   }
 
   // Phase 3.3 Bridge Hooks (UI Module Data translation)
-  MH_CreateHook((void *)(Globals::ModuleBase + 0xA98F40),
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0xA98F40),
                 MyHookComposeModuleUiData1, (void **)&OrigComposeModuleUiData1);
   MH_EnableHook((void *)(Globals::ModuleBase + 0xA98F40));
-  MH_CreateHook((void *)(Globals::ModuleBase + 0xA989A0),
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0xA989A0),
                 MyHookComposeModuleUiData2, (void **)&OrigComposeModuleUiData2);
   MH_EnableHook((void *)(Globals::ModuleBase + 0xA989A0));
 
   // Phase 3.4 Bridge Hooks (Manufacturer Data translation)
-  MH_CreateHook((void *)(Globals::ModuleBase + 0xA998A0),
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0xA998A0),
                 MyHookComposeShipManufacturerDataForId,
                 (void **)&OrigComposeShipManufacturerDataForId);
   MH_EnableHook((void *)(Globals::ModuleBase + 0xA998A0));
-  MH_CreateHook((void *)(Globals::ModuleBase + 0xA99B30),
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0xA99B30),
                 MyHookComposeShipManufacturerDataForLoadout,
                 (void **)&OrigComposeShipManufacturerDataForLoadout);
   MH_EnableHook((void *)(Globals::ModuleBase + 0xA99B30));
@@ -12003,7 +13230,7 @@ void InitEarlyHooks() {
   // streaming can proceed.
   {
     void *loadItemsAddr = (void *)(Globals::ModuleBase + 0x2D9390);
-    MH_STATUS s = MH_CreateHook(loadItemsAddr,
+    MH_STATUS s = MH_CreateHookGated(loadItemsAddr,
                                 reinterpret_cast<LPVOID>(MyHookLoadItemsAsync),
                                 reinterpret_cast<void **>(&OrigLoadItemsAsync));
     if (s == MH_OK) {
@@ -12017,7 +13244,7 @@ void InitEarlyHooks() {
   // Level streaming list-lookup / TMap lookup hook (RVA 0x3B07B0)
   {
     void *mapLookupAddr = (void *)(Globals::ModuleBase + 0x3B07B0);
-    MH_STATUS s = MH_CreateHook(mapLookupAddr,
+    MH_STATUS s = MH_CreateHookGated(mapLookupAddr,
                                 reinterpret_cast<LPVOID>(MyHookFUN_1403b07b0),
                                 reinterpret_cast<void **>(&OrigFUN_1403b07b0));
     if (s == MH_OK) {
@@ -12031,7 +13258,7 @@ void InitEarlyHooks() {
   // Hangar level-to-class lookup hook (RVA 0x372640)
   {
     void *classLookupAddr = (void *)(Globals::ModuleBase + 0x372640);
-    MH_STATUS s = MH_CreateHook(classLookupAddr,
+    MH_STATUS s = MH_CreateHookGated(classLookupAddr,
                                 reinterpret_cast<LPVOID>(MyHookFUN_140372640),
                                 reinterpret_cast<void **>(&OrigFUN_140372640));
     if (s == MH_OK) {
@@ -12045,7 +13272,7 @@ void InitEarlyHooks() {
   // Hangar transition callback bypass hook (RVA 0xAABF50)
   {
     void *callbackBypassAddr = (void *)(Globals::ModuleBase + 0xAABF50);
-    MH_STATUS s = MH_CreateHook(callbackBypassAddr,
+    MH_STATUS s = MH_CreateHookGated(callbackBypassAddr,
                                 reinterpret_cast<LPVOID>(MyHookAABF50),
                                 reinterpret_cast<void **>(&OrigFUN_140aabf50));
     if (s == MH_OK) {
@@ -12062,7 +13289,7 @@ void InitEarlyHooks() {
   {
     void *getUObjectFromWeakPtrAddr = (void *)(Globals::ModuleBase + 0xD6AD50);
     MH_STATUS s =
-        MH_CreateHook(getUObjectFromWeakPtrAddr,
+        MH_CreateHookGated(getUObjectFromWeakPtrAddr,
                       reinterpret_cast<LPVOID>(MyHookGetUObjectFromWeakPtr),
                       reinterpret_cast<void **>(&OrigGetUObjectFromWeakPtr));
     if (s == MH_OK) {
@@ -12080,7 +13307,7 @@ void InitEarlyHooks() {
   // violations
   {
     void *getFrontendHUDAddr = (void *)(Globals::ModuleBase + 0xAA5470);
-    MH_STATUS s = MH_CreateHook(getFrontendHUDAddr,
+    MH_STATUS s = MH_CreateHookGated(getFrontendHUDAddr,
                                 reinterpret_cast<LPVOID>(MyHookGetFrontendHUD),
                                 reinterpret_cast<void **>(&OrigGetFrontendHUD));
     if (s == MH_OK) {
@@ -12096,7 +13323,7 @@ void InitEarlyHooks() {
     void *processMulticastDelegateAddr =
         (void *)(Globals::ModuleBase + 0x2322A0);
     MH_STATUS s =
-        MH_CreateHook(processMulticastDelegateAddr,
+        MH_CreateHookGated(processMulticastDelegateAddr,
                       reinterpret_cast<LPVOID>(MyHookProcessMulticastDelegate),
                       reinterpret_cast<void **>(&OrigProcessMulticastDelegate));
     if (s == MH_OK) {
@@ -12108,34 +13335,60 @@ void InitEarlyHooks() {
     }
   }
 
-  MH_CreateHook((void *)(Globals::ModuleBase + 0x340340), GetShipByIdHook,
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0x340340), GetShipByIdHook,
                 &OrigGetShipById);
   MH_EnableHook((void *)(Globals::ModuleBase + 0x340340));
 
-  MH_CreateHook((void *)(Globals::ModuleBase + 0x5C8C00),
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0x5C8C00),
                 VehicleSkipUpdateCheck1Hook, &origVehicleSkipUpdateCheck1);
   MH_EnableHook((void *)(Globals::ModuleBase + 0x5C8C00));
 
-  MH_CreateHook((void *)(Globals::ModuleBase + 0x5C8DC0),
+  MH_CreateHookGated((void *)(Globals::ModuleBase + 0x5C8DC0),
                 VehicleSkipUpdateCheck2Hook, &origVehicleSkipUpdateCheck2);
   MH_EnableHook((void *)(Globals::ModuleBase + 0x5C8DC0));
 
-  void *hookRef2 = (void *)(Globals::ModuleBase + 0x055B050);
-  MH_CreateHook(hookRef2, JustReturnWhatWeWereGoingToReturn,
-                reinterpret_cast<LPVOID *>(&origJustReturn));
-  MH_EnableHook(hookRef2);
+  // Upstream's dedicated-server stubs, now off by default.
+  //
+  // These two exist for gwog's headless server build: 0x55B050 is replaced with
+  // "return nullptr" to stop the HUD being created for the listen player, and
+  // 0x36B2E0 is neutered so the match does not end when a player disconnects.
+  // A later upstream commit collapsed the separate Client and Server targets
+  // into one Release configuration, so a plain client ends up running both.
+  //
+  // That is very likely why the first successful map load died on
+  //     GameState_TDM_BP_C ... failed to route PostInitializeComponents
+  // which is an engine assertion, not a memory fault - the map loaded fine and
+  // the TDM game state spawned, but something in its init chain never
+  // completed. 0x55B050 is a 600-byte state-transition routine that writes
+  // several flags and drives sub-objects at +0x868 and +0x870; replacing it
+  // wholesale with a null return removes all of that.
+  //
+  // We are a listen server, not a headless one, so the client half of that work
+  // has to actually happen. Flip this on only if running headless.
+  static const bool kEnableDedicatedServerStubs = false;
 
-  void *hookRef3 = (void *)(Globals::ModuleBase + 0x036B2E0);
-  MH_CreateHook(hookRef3, EndMatchHook,
-                reinterpret_cast<LPVOID *>(&origEndMatch));
-  MH_EnableHook(hookRef3);
+  if (kEnableDedicatedServerStubs) {
+    void *hookRef2 = (void *)(Globals::ModuleBase + 0x055B050);
+    MH_CreateHookGated(hookRef2, JustReturnWhatWeWereGoingToReturn,
+                  reinterpret_cast<LPVOID *>(&origJustReturn));
+    MH_EnableHook(hookRef2);
+
+    void *hookRef3 = (void *)(Globals::ModuleBase + 0x036B2E0);
+    MH_CreateHookGated(hookRef3, EndMatchHook,
+                  reinterpret_cast<LPVOID *>(&origEndMatch));
+    MH_EnableHook(hookRef3);
+    tee_printf("[HOOK] Dedicated-server stubs ENABLED (0x55B050, 0x36B2E0)\n");
+  } else {
+    tee_printf("[HOOK] Dedicated-server stubs skipped - running as client / "
+               "listen server\n");
+  }
 
   // REMOVED - GC patch now runs ONLY in InitEarlyHooks (line ~3984)
   // Duplicate call was causing memory corruption by NOPping unrelated CALLs
 
   // MallocBinned Free Hook to prevent crashes on invalid/mismatched frees
   uintptr_t freeAddr = Globals::ModuleBase + 0xBFCA40;
-  MH_STATUS freeStatus = MH_CreateHook(
+  MH_STATUS freeStatus = MH_CreateHookGated(
       (LPVOID)freeAddr, reinterpret_cast<LPVOID>(MyHookFMallocBinnedFree),
       reinterpret_cast<void **>(&OrigFMallocBinnedFree));
   if (freeStatus == MH_OK) {
@@ -12502,6 +13755,46 @@ void ServerStartCallbacks() {
 void MainThread() {
   Globals::ModuleBase = (uintptr_t)GetModuleHandleA(nullptr);
 
+  // DN_INERT=1 returns immediately, so the DLL is loaded but does nothing at
+  // all: no SDK init, no memory scan, no hooks, no threads. Splits "the mod is
+  // present" from "the mod does something" when chasing the map-load race.
+  {
+    char b[8];
+    DWORD n = GetEnvironmentVariableA("DN_INERT", b, sizeof(b));
+    if (n == 1 && b[0] == '1') {
+      printf("[INIT] DN_INERT=1 - MainThread returning immediately.\n");
+      return;
+    }
+  }
+
+  // Battle servers get this DLL too, and must never run the offline bring-up.
+  //
+  // The mod lives in Binaries/Win64, so wer.dll loads it into EVERY DreadGame
+  // process - including the headless instance game-manager spawns for a match.
+  // That instance is launched with a clean environment, so DN_INERT set for the
+  // client does not reach it, and it came up with the full offline mod: a mock
+  // gateway on 18765, an injected -gatewayaddress, and - fatally - gwog's
+  // ServerStartCallbacks ServerTravelling it to the hardcoded DansMap instead of
+  // the map it was told to host. The client then travels to a battle server
+  // sitting on the wrong map and hangs on "match starting".
+  //
+  // -MatchID= is passed only by game-manager's spawner, so it identifies a
+  // battle server unambiguously; -server without the launcher's gateway args is
+  // the fallback for a hand-started host.
+  {
+    const wchar_t *rawCmd = GetCommandLineW();
+    std::wstring cmd = rawCmd ? rawCmd : L"";
+    for (size_t i = 0; i < cmd.size(); i++)
+      cmd[i] = (wchar_t)towlower(cmd[i]);
+    bool isBattleServer = cmd.find(L"-matchid=") != std::wstring::npos;
+    if (isBattleServer) {
+      g_serverMode = true;
+      printf("[INIT] Battle server detected (-MatchID on the command line) - "
+             "mod standing down so it hosts the map it was given.\n");
+      return;
+    }
+  }
+
   // Initialize fleet save path and load data
   char exePath[MAX_PATH];
   GetModuleFileNameA(NULL, exePath, MAX_PATH);
@@ -12514,22 +13807,85 @@ void MainThread() {
     Globals::AmServer = true;
   }
 
+  // DN_INIT_MAX=N performs only the first N init steps then returns, so the
+  // startup sequence can be bisected against the map-load race:
+  //   0 = nothing (same as DN_INERT)   1 = +LoadFleetData   2 = +InitConsole
+  //   3 = +InitSdk   4 = +Scanner::ScanAll   5 = +InitEarlyHooks
+  //   unset/6 = full startup, including the GWorld wait below
+  int initMax = 6;
+  {
+    char b[8];
+    DWORD n = GetEnvironmentVariableA("DN_INIT_MAX", b, sizeof(b));
+    if (n > 0 && n < sizeof(b)) {
+      initMax = atoi(std::string(b, n).c_str());
+      printf("[INIT] DN_INIT_MAX=%d\n", initMax);
+    }
+  }
+  if (initMax < 2) return;
+
   InitConsole();
+  if (initMax < 3) return;
+
   InitSdk();
+  if (initMax < 4) return;
+
   Scanner::ScanAll();
+  if (initMax < 5) return;
 
   InitEarlyHooks();
+  if (initMax < 6) return;
+
+  // GIsClient / GIsServer are single BYTES, one apart. The original code wrote
+  // uintptr_t to each, i.e. 8 bytes at +0x3e554b5 and 8 more at +0x3e554b6, so
+  // it clobbered roughly nine bytes of adjacent engine globals - and did it in
+  // a 1ms spin loop that runs concurrently with engine init and map load.
+  //
+  // DN_SERVERFLAGS selects the behaviour so the three can be compared:
+  //   "orig" - the original 8-byte writes
+  //   "byte" - correct 1-byte writes (default)
+  //   "skip" - do not write at all
+  //
+  // Only reached when -server is on the command line, which the headless
+  // harness passes and the retail client never does.
+  char sfBuf[16];
+  DWORD sfLen = GetEnvironmentVariableA("DN_SERVERFLAGS", sfBuf, sizeof(sfBuf));
+  std::string sfMode = (sfLen > 0 && sfLen < sizeof(sfBuf)) ? std::string(sfBuf, sfLen)
+                                                            : std::string("byte");
+  if (Globals::AmServer)
+    printf("[INIT] AmServer=1, GIsClient/GIsServer write mode = %s\n",
+           sfMode.c_str());
 
   while (!*UWorld::GWorld) {
-    if (Globals::AmServer) {
-      *(uintptr_t *)(Globals::ModuleBase + 0x3e554b5) = 0x0; // GIsClient
-      *(uintptr_t *)(Globals::ModuleBase + 0x3e554b6) = 0x1; // GIsServer
+    if (Globals::AmServer && sfMode != "skip") {
+      if (sfMode == "orig") {
+        *(uintptr_t *)(Globals::ModuleBase + 0x3e554b5) = 0x0; // GIsClient
+        *(uintptr_t *)(Globals::ModuleBase + 0x3e554b6) = 0x1; // GIsServer
+      } else {
+        *(uint8_t *)(Globals::ModuleBase + 0x3e554b5) = 0x0; // GIsClient
+        *(uint8_t *)(Globals::ModuleBase + 0x3e554b6) = 0x1; // GIsServer
+      }
     }
     Sleep(1);
   }
 
   if (Globals::AmServer) {
-    ServerStartCallbacks();
+    // Inherited from gwog's headless server target. The first thing it does is
+    // ServerTravel to a hardcoded DansMap, which fights whatever map was named
+    // on the command line - two map loads racing each other. Harmless for its
+    // original purpose (that build always hosted DansMap) but fatal to any
+    // attempt to host a specific map for testing.
+    //
+    // DN_NO_SERVER_CALLBACKS=1 skips it so the engine is left to load the map
+    // it was actually asked for.
+    char nscBuf[8];
+    DWORD nscLen =
+        GetEnvironmentVariableA("DN_NO_SERVER_CALLBACKS", nscBuf, sizeof(nscBuf));
+    if (nscLen == 1 && nscBuf[0] == '1') {
+      printf("[INIT] DN_NO_SERVER_CALLBACKS=1 - skipping gwog's server "
+             "start-up travel.\n");
+    } else {
+      ServerStartCallbacks();
+    }
   }
 
   if (!Globals::AmServer) {
@@ -12570,7 +13926,7 @@ void Init() {
 */
 BOOL WINAPI DllMain(HMODULE hMod, DWORD dwReason, LPVOID lpReserved) {
   switch (dwReason) {
-  case DLL_PROCESS_ATTACH:
+  case DLL_PROCESS_ATTACH: {
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     freopen("CONOUT$", "w", stderr);
@@ -12585,15 +13941,65 @@ BOOL WINAPI DllMain(HMODULE hMod, DWORD dwReason, LPVOID lpReserved) {
     tee_printf("--- DREADNOUGHT OFFLINE MOD ---\n");
     tee_printf("--- Built: %s %s ---\n", __DATE__, __TIME__);
     tee_printf("--------------------------------------------------\n\n");
-    // Hook GetCommandLineW EARLY (before game engine reads it)
-    InitGatewayHook();
-    // Hook WinHTTP to intercept all HTTP requests
-    InitWinHttpHooks();
-    // Start the mock gateway HTTP server
-    std::thread(GatewayServerThread).detach();
+    // Stand down the fake backend when a real one is present.
+    //
+    // These three exist to impersonate Mmogbrain offline: InitGatewayHook
+    // rewrites GetCommandLineW so the engine dials our mock, InitWinHttpHooks
+    // intercepts the HTTPS calls, and GatewayServerThread answers them. Against
+    // darkace1998's private server they are actively harmful - the injected
+    // "-gatewayaddress=127.0.0.1 -gatewayport=18765" overrode the launcher's
+    // real "-GatewayPort=65443", so the client talked to us instead of
+    // mmogbrain and never reached the backend at all.
+    //
+    // Detected from the command line rather than an environment variable,
+    // because dn-launcher.exe spawns the game itself and would not pass one on.
+    // DN_SERVER_MODE=1/0 forces the decision either way.
+    bool useRealBackend = false;
+    {
+      const wchar_t *rawCmd = GetCommandLineW();
+      std::wstring cmd = rawCmd ? rawCmd : L"";
+      for (size_t i = 0; i < cmd.size(); i++)
+        cmd[i] = (wchar_t)towlower(cmd[i]);
+      // Our own injected port means we are looking at a relaunch, not a server.
+      useRealBackend = cmd.find(L"-gatewayaddress=") != std::wstring::npos &&
+                       cmd.find(L"18765") == std::wstring::npos;
+
+      // A battle server spawned by game-manager (-MatchID=) has no launcher
+      // gateway args, so the check above would call it "offline" and start the
+      // mock gateway inside the match host. It is emphatically not offline -
+      // it IS part of the backend. See the battle-server note in MainThread.
+      if (cmd.find(L"-matchid=") != std::wstring::npos)
+        useRealBackend = true;
+
+      char sm[8];
+      DWORD smLen = GetEnvironmentVariableA("DN_SERVER_MODE", sm, sizeof(sm));
+      if (smLen == 1 && sm[0] == '1')
+        useRealBackend = true;
+      else if (smLen == 1 && sm[0] == '0')
+        useRealBackend = false;
+    }
+
+    g_serverMode = useRealBackend;
+
+    if (useRealBackend) {
+      tee_printf("[GATEWAY] Real backend detected on the command line - mock "
+                 "gateway, WinHTTP interception and command-line injection are "
+                 "all DISABLED.\n");
+      tee_printf("[GATEWAY] Server mode: the offline bring-up (fake login, "
+                 "ValidateSession patch, forced hangar) is OFF so the client "
+                 "authenticates for real. DN_SERVER_MODE=0 restores it.\n");
+    } else {
+      // Hook GetCommandLineW EARLY (before game engine reads it)
+      InitGatewayHook();
+      // Hook WinHTTP to intercept all HTTP requests
+      InitWinHttpHooks();
+      // Start the mock gateway HTTP server
+      std::thread(GatewayServerThread).detach();
+    }
     DisableThreadLibraryCalls(hMod);
     Init();
     break;
+  }
   case DLL_PROCESS_DETACH:
     if (debugLogFile.is_open()) {
       std::cout << "--- DLL_PROCESS_DETACH ---\n" << std::endl;
