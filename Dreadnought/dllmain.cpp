@@ -12770,6 +12770,69 @@ static UObject *GetHostPrecastLoadout() {
 // (Support/Cerberus) and we then handed that back, so the player got Cerberus
 // no matter what they picked. Registering without activating leaves the engine's
 // own ServerSpawnNearActor free to look up and activate the chosen hull.
+// ORBIT FLAG PROBE -- read-only, host side, DN_SERVER_LOADOUT only.
+//
+// AYOrbitTransitionManager's per-player teleport (verified .pdata entry
+// 0x3D92A0-0x3D9393) gates the whole thing on one byte:
+//
+//   0x3D9303  cmp  byte ptr [rdx + 0x948], 0
+//   0x3D930A  jne  0x3D9393        ; non-zero -> teleport proceeds
+//                                  ; zero -> "...that is not in orbit!"
+//
+// 0x5A8820's epilogue writes word [rdi+0x948] = 1 in constructor shape, so the
+// flag looks like it is born TRUE and something clears it. We have no credible
+// candidate for the clear -- 0xF46CB0 returns without copying when its source is
+// null, so it skips rather than zeroes.
+//
+// Rather than name a third static candidate, read the byte at the moment the
+// engine tests it. 0x948..0x954 are logged as a block because 0xF46CB0 copies
+// that whole run, so neighbouring values say whether the block looks
+// initialised or blank.
+//
+// This hook calls the original first and changes nothing.
+static void *OrigOrbitTeleportPlayer = nullptr;
+
+void __fastcall MyHookOrbitTeleportPlayer(void *self, void *player) {
+  static volatile LONG s_probes = 0;
+  // The LOGGING is capped; the force below must not be, or it would stop
+  // working after twelve calls.
+  bool verbose = InterlockedIncrement(&s_probes) <= 12;
+  {
+    if (player && IsReadableMemory((uint8_t *)player + 0x940, 0x20)) {
+      uint8_t *b = (uint8_t *)player + 0x948;
+      if (verbose)
+      tee_printf("[ORBIT-PROBE] player=%p inOrbit[0x948]=%u  block 0x948..0x954:"
+                 " %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X"
+                 " %02X\n",
+                 player, (unsigned)b[0], b[0], b[1], b[2], b[3], b[4], b[5],
+                 b[6], b[7], b[8], b[9], b[10], b[11], b[12]);
+
+      // Measured 2026-08-04: the flag AND its whole block read 00 on both
+      // players at the moment the engine tests them, so nothing is ever going
+      // to set it -- the host has no player record to populate it from, the
+      // same root as the empty loadout manager.
+      //
+      // Set it so the teleport proceeds. This is a deliberate lie to a gate
+      // whose backing data does not exist on a battle server; it is not a
+      // repair. If it turns out the player is genuinely not prepared for the
+      // arena, this will fail somewhere further in, and that failure is the
+      // next real thing to look at.
+      if (b[0] == 0 && BisectGetEnv("DN_NO_ORBIT_FORCE") != "1") {
+        b[0] = 1;
+        if (verbose)
+          tee_printf("[ORBIT-PROBE] forced inOrbit=1 for player=%p "
+                     "(DN_NO_ORBIT_FORCE=1 disables)\n",
+                     player);
+      }
+    } else if (verbose) {
+      tee_printf("[ORBIT-PROBE] player=%p NOT READABLE at +0x940\n", player);
+    }
+  }
+  typedef void(__fastcall * OrigFn)(void *, void *);
+  if (OrigOrbitTeleportPlayer)
+    ((OrigFn)OrigOrbitTeleportPlayer)(self, player);
+}
+
 static bool AddLoadoutOnlyGuarded(void *lmc, void *loadout) {
   typedef void(__fastcall * tAddOnly)(void *, void *);
   __try {
@@ -14375,6 +14438,17 @@ void MainThread() {
                "0x370970.\n");
       } else {
         printf("[INIT] host loadout fix: FAILED to hook 0x370970.\n");
+      }
+
+      // Read-only probe on the orbit teleport gate. See
+      // MyHookOrbitTeleportPlayer. Verified .pdata entry 0x3D92A0-0x3D9393.
+      uintptr_t orbitAddr = Globals::ModuleBase + 0x3D92A0;
+      if (MH_CreateHook((LPVOID)orbitAddr, &MyHookOrbitTeleportPlayer,
+                        &OrigOrbitTeleportPlayer) == MH_OK &&
+          MH_EnableHook((LPVOID)orbitAddr) == MH_OK) {
+        printf("[INIT] orbit probe: hooked teleport gate at 0x3D92A0.\n");
+      } else {
+        printf("[INIT] orbit probe: FAILED to hook 0x3D92A0.\n");
       }
       return;
     }
