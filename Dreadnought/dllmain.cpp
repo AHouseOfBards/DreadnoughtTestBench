@@ -12833,10 +12833,31 @@ void __fastcall MyHookOrbitTeleportPlayer(void *self, void *player) {
     ((OrigFn)OrigOrbitTeleportPlayer)(self, player);
 }
 
+// Genuinely add-only. Verified .pdata entry 0x3382F0-0x338330; signature
+// (manager, loadout, uint8 type) taken from the one call site inside
+// AddAndActivateLoadout: `mov r8b, 2 / mov rdx, rsi / mov rcx, rdi`.
+//
+// CORRECTED 2026-08-04. This function used to call 0x337450 and the name was a
+// lie: 0x337450 is AddANDActivateLoadout, and its tail
+//
+//   0x337527  mov r8b, 2 ; mov rdx, rsi ; mov rcx, rdi ; call 0x3382F0  <- add
+//   0x337535  lea rdx, [rsp+0x50] ; mov rcx, rdi ; call 0x337050        <- activate
+//
+// runs that second call UNCONDITIONALLY -- the only thing the entry-matching
+// loop above it skips is the add. So registering all four precast loadouts in
+// sequence left the LAST one active, and since the array ends with Support the
+// active loadout was always the Cerberus. We then read it back from
+// m_activeLoadout (lmc+0x208) and handed it to the spawner, which is why every
+// hull the player picked spawned a Cerberus. Confirmed in the host log: the
+// substituted pointer equals the Support CDO resolved four lines earlier.
+//
+// 0x3382F0 adds the entry with type 2 and stops, which is all registration was
+// ever supposed to do. Choosing is the engine's job -- see
+// MyHookFindLoadoutByID.
 static bool AddLoadoutOnlyGuarded(void *lmc, void *loadout) {
-  typedef void(__fastcall * tAddOnly)(void *, void *);
+  typedef void(__fastcall * tAddOnly)(void *, void *, uint8_t);
   __try {
-    ((tAddOnly)(Globals::ModuleBase + 0x337450))(lmc, loadout);
+    ((tAddOnly)(Globals::ModuleBase + 0x3382F0))(lmc, loadout, 2);
     return true;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
@@ -12863,6 +12884,157 @@ static void RegisterHostPrecastLoadouts(void *lmc) {
     tee_printf("[SPAWN-HOST] register %s -> %s\n", kHostPrecastCDONames[i],
                ok ? "ok" : "EXCEPTION");
   }
+}
+
+// Walk the manager's loadout entries and print the id each one would be matched
+// on, next to the id being searched for. This is the whole comparison
+// FindLoadoutByID performs, so if a lookup misses, these two columns say why.
+static void DumpManagerLoadoutIds(void *mgr, uint64_t want) {
+  uint8_t *m = (uint8_t *)mgr;
+  if (!IsReadableMemory(m + 0x108, 16))
+    return;
+  uint8_t *arr = *(uint8_t **)(m + 0x108);
+  int32_t n = *(int32_t *)(m + 0x110);
+  tee_printf("[LOADOUT-ID] manager=%p entries=%d want=0x%llX\n", mgr, n,
+             (unsigned long long)want);
+  if (!arr || n <= 0 || n > 64)
+    return;
+  for (int32_t e = 0; e < n; e++) {
+    uint8_t *ent = arr + (size_t)e * 0x30; // stride from the 0x340340 loop
+    if (!IsReadableMemory(ent, 16))
+      continue;
+    void **list = *(void ***)ent;
+    int32_t cnt = *(int32_t *)(ent + 8);
+    if (!list || cnt <= 0 || cnt > 64)
+      continue;
+    for (int32_t i = 0; i < cnt; i++) {
+      if (!IsReadableMemory((uint8_t *)&list[i], 8))
+        break;
+      void *lo = list[i];
+      if (!lo || !IsReadableMemory((uint8_t *)lo + 0xb0, 8))
+        continue;
+      uint64_t idv = *(uint64_t *)((uint8_t *)lo + 0xb0);
+      tee_printf("[LOADOUT-ID]   entry %d[%d] loadout=%p id=0x%llX%s\n", e, i,
+                 lo, (unsigned long long)idv,
+                 idv == want ? "  <== MATCHES want" : "");
+    }
+  }
+}
+
+// UYLoadoutManagerComponent::FindLoadoutByID, verified .pdata entry
+// 0x340340-0x3404D3.  (manager, id, warnOnMiss)
+//
+// It does NOT compare strings, despite the warning it prints naming one. The
+// loop at 0x3403A0 is
+//
+//     mov rcx, [rdx]                   ; a loadout out of the entry's array
+//     cmp qword ptr [rcx + 0xb0], r11  ; r11 = *(uint64*)id, loaded at 0x34038D
+//
+// a raw 8-byte compare of loadout+0xb0 against the dereferenced argument. That
+// is the same field AddAndActivateLoadout dedupes on, so the two agree.
+//
+// CORRECTED 2026-08-04 from a live run: those 8 bytes are an FNAME (index +
+// number), not an object pointer. The first observed value was 0x21F0F, which
+// is why the diagnostic below prints it as a number and not as an object name -
+// an earlier version ran it through GetName and got "unreadable", which was the
+// diagnostic being wrong rather than the data. 0xCA87B0, called only on the
+// miss path to build the warning text, is the FName->FString conversion.
+//
+// This is what makes the player's own choice of ship work.
+//
+// The client sends the id it picked -- verified across ten host logs, which
+// between them requested Assault, Dreadnought, Sniper and Support, so the pick
+// does reach the host and is not the thing that is broken. What is broken is
+// that a battle server's manager is EMPTY (it never logs in, so
+// LoadInstallingLadouts never runs), and 0x340340 returns null against an empty
+// array. ServerSpawnNearActor then throws the choice away:
+//
+//   FindLoadoutByID | Dind't find any loadouts matching id Default__VH_Sniper...
+//   ServerSpawnNearActor | Could not Set the active Loadout. Given loadout ID
+//                          does not exist in loadout manager!
+//
+// On a miss we register the four cooked precast loadouts and let the ENGINE run
+// its own lookup a second time. We do not pick a ship here and we never touch a
+// lookup that succeeded -- this only ever fills the hole, which is what makes it
+// safe to leave enabled once a real backend starts populating the manager.
+static void *OrigFindLoadoutByID = nullptr;
+
+// HUD SetEnergyWheelSelection, verified .pdata entry 0x551010-0x55108F, reached
+// through its single caller 0x587788.
+//
+// Read-only. Holding E does nothing at all and logs nothing at all - there is
+// not one LogYWidgetEnergyWheel line in a whole client session - and the open
+// path explains how that can happen silently:
+//
+//   0x551022  mov  rcx, [rbx + 0x870]   ; m_energyWheelSelector
+//   0x551029  test rcx, rcx
+//   0x55102C  je   0x551035             ; null -> try the PS4 selector at +0x868
+//   0x55102E  call 0x4999C0             ; otherwise toggle the wheel
+//   0x551035  mov  rcx, [rbx + 0x868]
+//   0x55103F  je   0x551046             ; also null -> fall through, do NOTHING
+//
+// So a null selector is a silent no-op, not an error. This probe distinguishes
+// the only two possibilities left: never called (the input never arrives) or
+// called with both selectors null (the widget was never created). The keybind
+// itself is already ruled out - Input.ini has "Open EnergyWheel" on Key=E.
+static void *OrigHudSetEnergyWheelSelection = nullptr;
+
+void __fastcall MyHookHudSetEnergyWheelSelection(void *self, uint8_t *sel) {
+  static int s_n = 0;
+  if (self && s_n++ < 10) {
+    void *selector = nullptr, *selectorPS4 = nullptr;
+    if (IsReadableMemory((uint8_t *)self + 0x868, 16)) {
+      selectorPS4 = *(void **)((uint8_t *)self + 0x868);
+      selector = *(void **)((uint8_t *)self + 0x870);
+    }
+    tee_printf("[EWHEEL] SetEnergyWheelSelection self=%p sel=%d selector=%p "
+               "selectorPS4=%p%s\n",
+               self, (sel && IsReadableMemory(sel, 1)) ? (int)*sel : -1,
+               selector, selectorPS4,
+               (!selector && !selectorPS4) ? "  <== BOTH NULL, E is a no-op"
+                                           : "");
+  }
+  typedef void(__fastcall * OrigFn)(void *, uint8_t *);
+  if (OrigHudSetEnergyWheelSelection)
+    ((OrigFn)OrigHudSetEnergyWheelSelection)(self, sel);
+}
+
+void *__fastcall MyHookFindLoadoutByID(void *mgr, void **id, uint8_t warn) {
+  typedef void *(__fastcall * OrigFn)(void *, void **, uint8_t);
+  if (!OrigFindLoadoutByID)
+    return nullptr;
+  void *found = ((OrigFn)OrigFindLoadoutByID)(mgr, id, warn);
+
+  // The engine found one. Never second-guess it.
+  if (found || !g_serverMode || !mgr || !id)
+    return found;
+
+  // Registering calls into the manager, which calls back in here. The
+  // per-manager guard inside RegisterHostPrecastLoadouts already terminates
+  // that, but this makes the re-entrancy explicit rather than incidental.
+  static thread_local bool s_inRetry = false;
+  if (s_inRetry)
+    return found;
+  s_inRetry = true;
+
+  static int s_logCount = 0;
+  bool verbose = (s_logCount++ < 6);
+
+  uint64_t want =
+      IsReadableMemory((uint8_t *)id, 8) ? *(uint64_t *)id : 0ull;
+  RegisterHostPrecastLoadouts(mgr);
+  void *retry = ((OrigFn)OrigFindLoadoutByID)(mgr, id, 0);
+  s_inRetry = false;
+
+  if (verbose) {
+    tee_printf("[LOADOUT-ID] miss for FName 0x%llX -> after registering: %s\n",
+               (unsigned long long)want, retry ? "FOUND" : "STILL MISSING");
+    // Only dump the table when the retry failed - that is the case where the
+    // two id columns are the thing we need to read.
+    if (!retry)
+      DumpManagerLoadoutIds(mgr, want);
+  }
+  return retry;
 }
 
 // UYLoadoutManagerComponent::ActivateLoadout, verified entry 0x336C90.
@@ -12996,15 +13168,29 @@ void *__fastcall MyHookGetLoadoutForSpawn(void *gameMode, void *pc) {
   // construction. Fall back to the cooked precast assets. See
   // GetHostPrecastLoadout.
   //
-  // Register all four FIRST, so the engine's own ServerSpawnNearActor lookup
-  // can find the hull the player actually chose. Only if that still leaves us
-  // with nothing do we substitute one ourselves.
+  // Reaching here at all now means the player's own choice never landed:
+  // MyHookFindLoadoutByID registers the same four loadouts at the earlier
+  // ServerSpawnNearActor lookup, and when that works the engine activates the
+  // chosen hull and 0x370970 returns it, so this whole branch is skipped.
+  //
+  // m_activeLoadout is still read first, because if anything upstream did
+  // manage to activate one it is by definition better informed than we are.
+  // Only when that is empty too do we substitute, and then it is the first
+  // precast (Assault) as an arbitrary but honest default -- NOT a choice.
+  //
+  // Registration is add-only since 2026-08-04. It used to run
+  // AddAndActivateLoadout over all four, which left the last one (Support)
+  // active and made every player spawn a Cerberus.
   if (!chosen && g_serverMode) {
     RegisterHostPrecastLoadouts(lmc);
     void *active = nullptr;
     if (IsWritableMemory((uint8_t *)lmc + 0x208, 8))
       active = *(void **)((uint8_t *)lmc + 0x208);
     chosen = active ? (UObject *)active : GetHostPrecastLoadout();
+    if (verbose)
+      tee_printf("[SPAWN] host fallback: activeLoadout=%p chosen=%p (%s)\n",
+                 active, (void *)chosen,
+                 active ? "engine's own" : "arbitrary default, choice was lost");
   }
 
   if (!chosen) {
@@ -13878,9 +14064,26 @@ void InitEarlyHooks() {
     }
   }
 
+  // NOTE 2026-08-04: 0x340340 is UYLoadoutManagerComponent::FindLoadoutByID,
+  // not a "get ship by id" - confirmed from its own disassembly and from
+  // darkace's battle-server-data-path.md, which names FUN_140340340 and the
+  // FName at loadout+0xb0 it matches on. The hook below is INERT: THELOADOUT
+  // (line ~893) is never assigned anywhere, only THELOADOUT_CLASS is, so it
+  // always falls through to the original. Left alone rather than removed
+  // because it currently changes nothing; renaming it is a separate cleanup.
+  // The server-side hook on this same address is MyHookFindLoadoutByID, and the
+  // two never coexist - a battle server returns before reaching this line.
   MH_CreateHookGated((void *)(Globals::ModuleBase + 0x340340), GetShipByIdHook,
                 &OrigGetShipById);
   MH_EnableHook((void *)(Globals::ModuleBase + 0x340340));
+
+  // Read-only energy wheel probe. See MyHookHudSetEnergyWheelSelection.
+  if (BisectGetEnv("DN_NO_EWHEEL_PROBE") != "1") {
+    MH_CreateHookGated((void *)(Globals::ModuleBase + 0x551010),
+                       MyHookHudSetEnergyWheelSelection,
+                       &OrigHudSetEnergyWheelSelection);
+    MH_EnableHook((void *)(Globals::ModuleBase + 0x551010));
+  }
 
   MH_CreateHookGated((void *)(Globals::ModuleBase + 0x5C8C00),
                 VehicleSkipUpdateCheck1Hook, &origVehicleSkipUpdateCheck1);
@@ -14428,6 +14631,22 @@ void MainThread() {
         printf("[INIT] host loadout fix: MH_Initialize failed, standing down "
                "fully.\n");
         return;
+      }
+
+      // Installed FIRST, deliberately. This is the hook that lets the engine
+      // resolve the hull the player actually picked; the spawn hook below is
+      // only the last-resort filler for when even that finds nothing.
+      // Verified .pdata entry 0x340340-0x3404D3. See MyHookFindLoadoutByID.
+      uintptr_t findLoadoutAddr = Globals::ModuleBase + 0x340340;
+      if (BisectGetEnv("DN_NO_LOADOUT_ID") != "1" &&
+          MH_CreateHook((LPVOID)findLoadoutAddr, &MyHookFindLoadoutByID,
+                        &OrigFindLoadoutByID) == MH_OK &&
+          MH_EnableHook((LPVOID)findLoadoutAddr) == MH_OK) {
+        printf("[INIT] host loadout fix: hooked FindLoadoutByID at 0x340340 "
+               "(DN_NO_LOADOUT_ID=1 disables).\n");
+      } else {
+        printf("[INIT] host loadout fix: FindLoadoutByID at 0x340340 not "
+               "hooked.\n");
       }
 
       uintptr_t spawnLoadoutAddr = Globals::ModuleBase + 0x370970;
