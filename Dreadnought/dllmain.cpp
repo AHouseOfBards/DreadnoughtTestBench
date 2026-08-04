@@ -13019,6 +13019,292 @@ static void DumpManagerLoadoutIds(void *mgr, uint64_t want) {
 // safe to leave enabled once a real backend starts populating the manager.
 static void *OrigFindLoadoutByID = nullptr;
 
+// Does the player's ship actually HAVE its effect components, and do they have
+// anything to play?
+//
+// Established by measurement, not argument:
+//   - level-placed particles render; impact effects render
+//   - muzzle flashes and thruster trails do not, and NOTHING errors
+//   - SpawnEmitterAttached is called twice in a whole session, both times for
+//     the warp gate, both with a valid template and a valid component. So ship
+//     effects are not runtime-spawned emitters at all.
+//
+// That leaves the other way UE4 does this: UParticleSystemComponents built into
+// the ship and its modules, switched on rather than created. A component whose
+// Template is null plays nothing and says nothing - the same silence a null
+// spawn template gave us.
+//
+// Offsets are from the generated SDK, not guessed:
+//   UObject::Outer                             0x020
+//   UActorComponent::bIsActive           bit at 0x0A2
+//   USceneComponent::bVisible            bit at 0x120
+//   UParticleSystemComponent::Template         0x650
+//   UParticleSystemComponent::RequiredSignificance 0x67C
+//
+// Three outcomes, all decisive:
+//   no components at all  -> never created, so the loadout/module data is the
+//                            place to look
+//   null templates        -> created, but no effect asset was assigned
+//   real templates        -> they exist and something downstream suppresses
+//                            them, and RequiredSignificance is the first
+//                            suspect since YParticleManagerConfig reads its
+//                            significance levels from an ini we do not have.
+static void DumpPawnParticleComponents(void *pawn, const char *when) {
+  if (!pawn)
+    return;
+  // GetName() on every UClass in a 100k+ object table would be far too slow, so
+  // remember the verdict per class pointer. There are only a few thousand
+  // classes and we hit each one once.
+  static std::map<void *, bool> s_isPsc;
+  int found = 0, nullTemplate = 0;
+
+  auto &objs = UObject::GetGlobalObjects();
+  for (int32_t i = 0; i < objs.Count(); ++i) {
+    UObject *o = objs.GetByIndex(i);
+    if (!o || !o->Class)
+      continue;
+
+    bool isPsc;
+    auto it = s_isPsc.find((void *)o->Class);
+    if (it != s_isPsc.end()) {
+      isPsc = it->second;
+    } else {
+      std::string cls;
+      try {
+        cls = o->Class->GetName();
+      } catch (...) {
+        cls.clear();
+      }
+      isPsc = cls.find("ParticleSystemComponent") != std::string::npos;
+      s_isPsc[(void *)o->Class] = isPsc;
+    }
+    if (!isPsc)
+      continue;
+
+    // A component's Outer is the actor that owns it.
+    if (!IsReadableMemory((uint8_t *)o + 0x20, 8))
+      continue;
+    if (*(void **)((uint8_t *)o + 0x20) != pawn)
+      continue;
+
+    found++;
+    void *tmpl = nullptr;
+    unsigned sig = 0xFF;
+    int active = -1, visible = -1;
+    if (IsReadableMemory((uint8_t *)o + 0x650, 8))
+      tmpl = *(void **)((uint8_t *)o + 0x650);
+    if (IsReadableMemory((uint8_t *)o + 0x67C, 1))
+      sig = *((uint8_t *)o + 0x67C);
+    if (IsReadableMemory((uint8_t *)o + 0xA2, 1))
+      active = (*((uint8_t *)o + 0xA2) & 1) ? 1 : 0;
+    if (IsReadableMemory((uint8_t *)o + 0x120, 1))
+      visible = (*((uint8_t *)o + 0x120) & 1) ? 1 : 0;
+
+    std::string tmplName = "NULL  <== nothing to play";
+    if (tmpl) {
+      try {
+        tmplName = ((UObject *)tmpl)->GetName();
+      } catch (...) {
+        tmplName = "(name threw)";
+      }
+    } else {
+      nullTemplate++;
+    }
+    std::string own = "?";
+    try {
+      own = o->GetName();
+    } catch (...) {
+    }
+    tee_printf("[PSC] %-6s %-42s template=%-34s active=%d visible=%d "
+               "significance=%u\n",
+               when, own.c_str(), tmplName.c_str(), active, visible, sig);
+  }
+  tee_printf("[PSC] %-6s TOTAL on pawn=%d, with a null template=%d%s\n", when,
+             found, nullTemplate,
+             found == 0 ? "  <== the ship has NO particle components at all"
+                        : "");
+
+  // The thruster components exist with correct VH_ASM_Thrusters*_PS templates
+  // and sit at active=0 visible=0, so nothing ever switches them on. The thing
+  // that would is UYThrusterComponent, and the ship also does not thrust -
+  // it holds position, sinks and tumbles - so these are probably one fault.
+  //
+  // Offsets from the generated SDK, and the neighbouring one is independently
+  // corroborated: the SDK puts AYPawn::m_weaponManager at 0x868, which is
+  // exactly the offset UpdateWeaponSettings reads in its own disassembly.
+  //
+  //   AYPawn::m_thrusterComponent                     0x8A0
+  //   UYThrusterComponent::m_thrusterDisplayInfos     0x120  (TArray)
+  //   UYThrusterComponent::m_thruster                 0x130  (TArray)
+  //   TArray layout: Data at +0, Count at +8
+  //
+  // An empty m_thruster is the answer if it reads 0: the component exists but
+  // has no thrusters registered, so there is nothing to drive the effects OR
+  // the ship. That would put the cause back in the module/loadout data rather
+  // than anywhere near rendering.
+  if (!IsReadableMemory((uint8_t *)pawn + 0x8A0, 8)) {
+    tee_printf("[THRUST] %-6s pawn+0x8A0 unreadable\n", when);
+    return;
+  }
+  void *tc = *(void **)((uint8_t *)pawn + 0x8A0);
+  if (!tc) {
+    tee_printf("[THRUST] %-6s m_thrusterComponent=NULL  <== the ship has no "
+               "thruster component at all\n",
+               when);
+    return;
+  }
+  if (!IsReadableMemory((uint8_t *)tc + 0x120, 0x20)) {
+    tee_printf("[THRUST] %-6s m_thrusterComponent=%p (fields unreadable)\n",
+               when, tc);
+    return;
+  }
+  int32_t displayCount = *(int32_t *)((uint8_t *)tc + 0x128);
+  int32_t thrusterCount = *(int32_t *)((uint8_t *)tc + 0x138);
+  tee_printf("[THRUST] %-6s component=%p  m_thruster=%d  displayInfos=%d%s\n",
+             when, tc, thrusterCount, displayCount,
+             thrusterCount == 0
+                 ? "  <== NO THRUSTERS REGISTERED: nothing to drive the ship "
+                   "or its effects"
+                 : "  <== thrusters ARE registered, so something else is "
+                   "leaving them off");
+
+  // m_thruster is TArray<FYThrusterInstanceInfo>, stride 0x20:
+  //   0x00 float m_oldVal            <- the last value UpdateThruster*(float)
+  //                                     was called with
+  //   0x08 UParticleSystemComponent* m_particleSystem
+  //
+  // m_oldVal is the discriminator, and it needs no hook. UpdateThrusterBack and
+  // friends take an input value and this is where the previous one is kept, so
+  // a non-zero reading proves the drivers ARE running (and something else is
+  // suppressing the visuals), while all-zero proves the input never arrives.
+  void *arr = *(void **)((uint8_t *)tc + 0x130);
+  if (arr && thrusterCount > 0 && thrusterCount <= 32) {
+    int nonZero = 0;
+    for (int32_t t = 0; t < thrusterCount; t++) {
+      uint8_t *e = (uint8_t *)arr + (size_t)t * 0x20;
+      if (!IsReadableMemory(e, 0x20))
+        break;
+      float oldVal = *(float *)e;
+      void *psc = *(void **)(e + 8);
+      if (oldVal != 0.0f)
+        nonZero++;
+      tee_printf("[THRUST] %-6s   thruster[%d] m_oldVal=%.3f psc=%p\n", when, t,
+                 oldVal, psc);
+    }
+    tee_printf("[THRUST] %-6s   %d of %d thrusters have a non-zero input%s\n",
+               when, nonZero, thrusterCount,
+               nonZero == 0 ? "  <== UpdateThruster* NEVER RECEIVES INPUT"
+                            : "  <== the drivers ARE running");
+  }
+
+  // And the movement side, because the ship also refuses to fly.
+  // UYVehicleMovementComp::m_replicatedState is at 0x210 (FYReplicatedVehicleState,
+  // six floats: steering, throttle, vertical, turnRight, ascend, descend).
+  // Found the same way as the particle components - by Outer - since APawn has
+  // no generic pointer to it.
+  static std::map<void *, bool> s_isVmc;
+  for (int32_t i = 0; i < objs.Count(); ++i) {
+    UObject *o = objs.GetByIndex(i);
+    if (!o || !o->Class)
+      continue;
+    bool isVmc;
+    auto it = s_isVmc.find((void *)o->Class);
+    if (it != s_isVmc.end()) {
+      isVmc = it->second;
+    } else {
+      std::string cls;
+      try {
+        cls = o->Class->GetName();
+      } catch (...) {
+        cls.clear();
+      }
+      isVmc = cls.find("VehicleMovementComp") != std::string::npos;
+      s_isVmc[(void *)o->Class] = isVmc;
+    }
+    if (!isVmc)
+      continue;
+    if (!IsReadableMemory((uint8_t *)o + 0x20, 8))
+      continue;
+    if (*(void **)((uint8_t *)o + 0x20) != pawn)
+      continue;
+    if (!IsReadableMemory((uint8_t *)o + 0x210, 0x18))
+      continue;
+    float *s = (float *)((uint8_t *)o + 0x210);
+    tee_printf("[MOVE] %-6s comp=%p steering=%.3f throttle=%.3f vertical=%.3f "
+               "turnRight=%.3f ascend=%.3f descend=%.3f%s\n",
+               when, (void *)o, s[0], s[1], s[2], s[3], s[4], s[5],
+               (s[0] == 0.0f && s[1] == 0.0f && s[2] == 0.0f)
+                   ? "  <== NO INPUT reaching the vehicle"
+                   : "");
+    break;
+  }
+}
+
+// UGameplayStatics::SpawnEmitterAttached, verified .pdata entry
+// 0x19556B0-0x1955736.
+//
+// This is the probe for the missing ship VFX, and the reason it is the right
+// one is in the function's own prologue:
+//
+//   0x19556EA  test rcx, rcx   ; EmitterTemplate
+//   0x19556ED  je   0x195572F  ; NULL -> xor eax,eax and return. SILENTLY.
+//   0x19556EF  test rdx, rdx   ; AttachToComponent
+//   0x19556F2  jne  0x1955736  ; the "NULL AttachComponent specified!" log
+//                              ; only ever covers the SECOND argument
+//
+// A null effect template produces no effect and no log line. That matches what
+// we see exactly: impacts render (those are spawned at a world location by a
+// different function), muzzle flashes and thruster trails do not, and a whole
+// session contains no complaint from anything.
+//
+// So the question is simply whether the game asks for these effects with a null
+// template, or does not ask at all. Those have completely different causes and
+// this separates them in one run.
+//
+// Signature: args 1 and 2 are rcx/rdx and certain, which is all we log. The
+// tail is the standard UE 4.13 shape (FName, FVector*, FRotator*, enum, bool),
+// consistent with the two stack slots this function reads 16 bytes apart at
+// [rbp+0x6f] and [rbp+0x7f]. Forwarded positionally and otherwise untouched.
+// DN_NO_EMITTER_PROBE=1 disables it.
+static void *OrigSpawnEmitterAttached = nullptr;
+
+void *__fastcall MyHookSpawnEmitterAttached(void *emitterTemplate,
+                                            void *attachToComponent,
+                                            uint64_t attachPointName,
+                                            void *location, void *rotation,
+                                            uint32_t locationType,
+                                            bool autoDestroy) {
+  static int s_n = 0;
+  static int s_nullTemplate = 0;
+  if (!emitterTemplate)
+    s_nullTemplate++;
+  if (s_n++ < 40) {
+    std::string tmplName = "NULL  <== no effect asset, returns silently";
+    if (emitterTemplate && IsReadableMemory((uint8_t *)emitterTemplate, 0x40)) {
+      try {
+        tmplName = ((UObject *)emitterTemplate)->GetName();
+      } catch (...) {
+        tmplName = "(name threw)";
+      }
+    }
+    tee_printf("[EMITTER] SpawnEmitterAttached template=%p %s attachTo=%p%s\n",
+               emitterTemplate, tmplName.c_str(), attachToComponent,
+               attachToComponent ? "" : "  <== NULL attach component");
+  } else if (s_n == 41) {
+    tee_printf("[EMITTER] (further calls not logged; %d of the first %d had a "
+               "NULL template)\n",
+               s_nullTemplate, s_n - 1);
+  }
+
+  typedef void *(__fastcall * OrigFn)(void *, void *, uint64_t, void *, void *,
+                                      uint32_t, bool);
+  if (!OrigSpawnEmitterAttached)
+    return nullptr;
+  return ((OrigFn)OrigSpawnEmitterAttached)(emitterTemplate, attachToComponent,
+                                            attachPointName, location, rotation,
+                                            locationType, autoDestroy);
+}
+
 // AYPlayerController::UpdateWeaponSettings, verified .pdata primary entry
 // 0x5A4600 (the "Invalid active weapon" literal lives in its cold chunk
 // 0x5A4666-0x5A46BE, so the log line alone would not have told us the function
@@ -13090,6 +13376,17 @@ void __fastcall MyHookUpdateWeaponSettings(void *pc) {
   tee_printf("[WEAPON] pc=%p pawn=%p container=%p activeIndex=%d count=%d "
              "arr=%p%s\n",
              pc, pawn, cont, activeIdx, count, arr, verdict);
+
+  // Piggyback the particle-component dump on this, because it is the one place
+  // we already hold a valid client-side pawn. Twice, spaced out: components
+  // could plausibly be attached after the weapons arrive, and a single early
+  // snapshot would report them missing when they are merely late.
+  static int s_dumps = 0;
+  if (count > 0 && s_dumps < 2 &&
+      BisectGetEnv("DN_NO_PSC_DUMP") != "1") {
+    DumpPawnParticleComponents(pawn, s_dumps == 0 ? "first" : "later");
+    s_dumps++;
+  }
 }
 
 // HUD SetEnergyWheelSelection, verified .pdata entry 0x551010-0x55108F, reached
@@ -14251,6 +14548,13 @@ void InitEarlyHooks() {
   MH_CreateHookGated((void *)(Globals::ModuleBase + 0x340340), GetShipByIdHook,
                 &OrigGetShipById);
   MH_EnableHook((void *)(Globals::ModuleBase + 0x340340));
+
+  // Read-only attached-emitter probe. See MyHookSpawnEmitterAttached.
+  if (BisectGetEnv("DN_NO_EMITTER_PROBE") != "1") {
+    MH_CreateHookGated((void *)(Globals::ModuleBase + 0x19556B0),
+                       MyHookSpawnEmitterAttached, &OrigSpawnEmitterAttached);
+    MH_EnableHook((void *)(Globals::ModuleBase + 0x19556B0));
+  }
 
   // Read-only weapon probe. See MyHookUpdateWeaponSettings.
   if (BisectGetEnv("DN_NO_WEAPON_PROBE") != "1") {
