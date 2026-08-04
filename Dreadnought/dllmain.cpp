@@ -75,15 +75,42 @@ static void tee_printf(const char *fmt, ...) {
 static void InitLogging() {
   InitializeCriticalSection(&g_logCS);
 
-  // Open log file next to the game EXE
+  // Open log file next to the game EXE.
+  //
+  // Battle servers get their OWN file. wer.dll side-loads this DLL into every
+  // DreadGame process, so a match has two of them running, and both used to
+  // fopen(..., "w") the same path: the battle server (started ~9 minutes into a
+  // session) truncated the client's log out from under it, after which the two
+  // kept writing at their own independent offsets and interleaved into a
+  // NUL-padded mess. Everything the client logged before the match - including
+  // the startup patch banners we grep for - was simply gone, and the file read
+  // as binary. Measured 2026-08-02: a client log with [PATCH]/[ORBIT] lines came
+  // back with zero of either and the battle server's banner at offset 0.
+  //
+  // Keying off -matchid= matches the stand-down check in MainThread, and leaves
+  // the client on the stable path that the scripts and greps already use. The
+  // pid keeps two concurrent matches from colliding with each other.
   char logPath[MAX_PATH];
   GetModuleFileNameA(NULL, logPath, MAX_PATH);
+  bool isBattleServer = false;
+  {
+    const wchar_t *rawCmd = GetCommandLineW();
+    std::wstring cmd = rawCmd ? rawCmd : L"";
+    for (size_t i = 0; i < cmd.size(); i++)
+      cmd[i] = (wchar_t)towlower(cmd[i]);
+    isBattleServer = cmd.find(L"-matchid=") != std::wstring::npos;
+  }
+  char logName[64];
+  if (isBattleServer)
+    sprintf(logName, "dread_mod_log_server_%lu.txt", GetCurrentProcessId());
+  else
+    strcpy(logName, "dread_mod_log.txt");
   // Replace exe name with our log name
   char *lastSlash = strrchr(logPath, '\\');
   if (lastSlash)
-    strcpy(lastSlash + 1, "dread_mod_log.txt");
+    strcpy(lastSlash + 1, logName);
   else
-    strcpy(logPath, "dread_mod_log.txt");
+    strcpy(logPath, logName);
 
   g_logFile = fopen(logPath, "w"); // overwrite each session
   if (g_logFile) {
@@ -6794,6 +6821,24 @@ void ProcessEventHook(UObject *object, UFunction *function, void *params) {
     return;
   }
 
+  // Server mode: pass straight through.
+  //
+  // Bisected 2026-08-03 with DN_RVA_MAX: hooks 0..15 are clean against a live
+  // backend, adding this one (#16, ProcessEvent at 0xD5B180) reproduces the
+  // crash every time. Everything below is offline bring-up -- it fabricates the
+  // item cache, tech tree, fleet and hangar state that the server now serves,
+  // and feeding invented data back into real data is what null-derefs the
+  // teardown loop at 0x31C440 (AV reading 0x8).
+  //
+  // Offline play is no longer a goal, so this is a pass-through rather than a
+  // branch-by-branch gate. DN_SERVER_MODE=0 restores the old behaviour if any
+  // of it is ever needed again.
+  if (g_serverMode) {
+    if (pProcessEvent_Original)
+      pProcessEvent_Original(object, function, params);
+    return;
+  }
+
   std::string funcName = function->GetFullName();
 
   // === AUDIT TRACER ===
@@ -8899,6 +8944,7 @@ static bool CaseInsensitiveContains(const std::string &haystack,
 }
 
 void UnpauseHangarAnimations() {
+  if (g_serverMode) return;   // offline-only; see TriggerLevelActorLinks
   if (!*UWorld::GWorld) return;
   UWorld* world = *UWorld::GWorld;
   if (!world->PersistentLevel) return;
@@ -8931,6 +8977,11 @@ void UnpauseHangarAnimations() {
 }
 
 void TriggerLevelActorLinks() {
+  // Offline-only. With a backend the server drives the hangar, and forcing the
+  // level-actor links here half-initialises actors that then tick against null
+  // state: VH_CustomisationPreview_BP_C::ReceiveTick spams script warnings and
+  // the teardown loop at 0x31C440 dereferences a null array (AV reading 0x8).
+  if (g_serverMode) return;
   if (g_levelActorLinksAttempted) {
     return;
   }
@@ -9398,7 +9449,7 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
         onHangarMap = true;
       }
     }
-    if (onHangarMap) {
+    if (onHangarMap && !g_serverMode) {  // offline-only hangar bring-up
       auto crewMeshes = UObject::FindObjects<USkeletalMeshComponent>();
       for (auto comp : crewMeshes) {
         if (comp && comp->AnimScriptInstance) {
@@ -9496,6 +9547,81 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
               *flags |= (1 << 5) | (1 << 6); // bShouldBeLoaded|bShouldBeVisible
               tee_printf("[LEVELS]   -> requested load (flags now 0x%02X)\n",
                          *flags);
+            }
+          }
+        }
+
+        // ---- Force the ORBIT INTRO sublevel, and only that one ----
+        //
+        // This is the targeted version of the reverted experiment above. The
+        // orbit spawn locations live in the map's "_INTRO" sublevel, and
+        // AYOrbitTransitionManager::ActivateBattlePlayerStarts (0x3B54D0) bails
+        // when its count is zero:
+        //
+        //   83 b9 a8 04 00 00 00   cmp dword [rcx+0x4A8], 0
+        //   7f 46                  jg  proceed          ; else log and return
+        //
+        // Against a real backend MP_Highlands_INTRO comes up
+        // Loaded=0 Vis=0 LoadedLevel=NULL, so the count stays 0, no player
+        // start is activated, nothing calls SpawnDefaultPawn (our 0x370970 hook
+        // never fires), and the view falls back to world origin -- under the
+        // terrain. In the offline Amirani run that DID work, MP_Amirani_INTRO
+        // was loaded=1 from the start, so this restores the known-good state.
+        //
+        // Deliberately NOT INTRO02: the two are mutually exclusive variants and
+        // loading both is what flattened the backdrop last time. Matching on
+        // "_INTRO" with the "02" case excluded keeps to the engine's own choice.
+        //
+        // DISABLED BY DEFAULT 2026-08-03, because the reasoning above is wrong.
+        // The server side measured the same map and binary across four game
+        // modes with no client attached:
+        //
+        //   mode              _INTRO streamed   "no orbit spawn locations set!"
+        //   TM                no                YES
+        //   TDM               no                no
+        //   BC                no                no
+        //   map default       no                no
+        //
+        // _INTRO is absent in EVERY mode, including the three that never fail,
+        // so its absence cannot be what empties the count at [this+0x4A8]. TM
+        // being the only mode that fails is the actual signal. The shipped
+        // streaming table settles it: the Intro row is m_loadOnDedicatedServer
+        // false on every map, while twelve other Highlands rows are true - a
+        // host is DESIGNED not to have this sublevel, so forcing it fights the
+        // data rather than restoring a lost state. The Amirani run that made
+        // this look right was offline, where the client is also the host.
+        //
+        // Kept behind DN_FORCE_INTRO=1 only so the experiment can be re-run
+        // cheaply if the mode angle dead-ends. Do not turn it on by default
+        // without new evidence.
+        if (BisectGetEnv("DN_FORCE_INTRO") == "1") {
+          static bool s_introRequested = false;
+          if (!s_introRequested) {
+            for (int i = 0; i < sls.Count() && i < 32; ++i) {
+              ULevelStreaming *sl = sls[i];
+              if (!sl || sl->IsLevelLoaded())
+                continue;
+              FString *pf = (FString *)((uintptr_t)sl + 0x40);
+              if (!pf || !pf->Data() || !IsWritableMemory(pf->Data(), 2))
+                continue;
+              std::string nm = pf->ToString();
+              if (nm.size() < 6)
+                continue;
+              // endswith "_INTRO" on the package name, so INTRO02 is excluded
+              size_t dot = nm.find_last_of('.');
+              std::string pkg = (dot == std::string::npos) ? nm : nm.substr(0, dot);
+              if (pkg.size() < 6 ||
+                  pkg.compare(pkg.size() - 6, 6, "_INTRO") != 0)
+                continue;
+              uint8_t *flags = (uint8_t *)((uintptr_t)sl + 0xB0);
+              if (!IsWritableMemory(flags, 1))
+                continue;
+              *flags |= (1 << 5) | (1 << 6); // bShouldBeLoaded|bShouldBeVisible
+              s_introRequested = true;
+              tee_printf("[ORBIT] Forced orbit INTRO sublevel load: %s "
+                         "(flags now 0x%02X) - ActivateBattlePlayerStarts needs "
+                         "its spawn locations\n",
+                         nm.c_str(), *flags);
             }
           }
         }
@@ -9765,6 +9891,17 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
   // ----------------------------------------------------
   // PREVIEW SHIP ANIMATION BLUEPRINT INSTANTIATION
   // ----------------------------------------------------
+  // UN-GATED 2026-08-03. This block was made offline-only earlier the same day
+  // on the theory that "against a real backend the hangar builds its own
+  // preview". That theory was speculative, it was measured NOT to fix the crash
+  // it was added for (the real causes were the ProcessEvent hook and the
+  // per-frame GObjects walk, both fixed elsewhere), and it is what broke ship
+  // previews against the server: selecting a hull in the tech tree left the
+  // viewport empty, with only the flagship visible outside the tech trees.
+  //
+  // So the backend does NOT build its own preview - the client needs this to
+  // instantiate VH_CustomisationPreview_BP_C either way. Leaving a visible
+  // feature broken to keep a gate that fixed nothing is the wrong trade.
   if (!g_matchTravelIssued && *UWorld::GWorld) {
     static int previewCheckFrame = 0;
     previewCheckFrame++;
@@ -9990,7 +10127,12 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
   }
 
   static int frameCounter = 0;
-  if (++frameCounter % 300 == 0) { // Every ~5 seconds at 60fps
+  // DN_DIAG_CAM=1 re-enables the 5-second camera/level dump. It also walks all
+  // of GObjects (FindObjects<ACameraActor>), so it carries the same tearing
+  // risk as the per-frame pass below -- 12x less often, but during a map load
+  // "less often" is not "safe". It is pure diagnostics, so it stays off unless
+  // asked for.
+  if (++frameCounter % 300 == 0 && BisectGetEnv("DN_DIAG_CAM") == "1") {
     if (!g_matchTravelIssued && *UWorld::GWorld) {
       UWorld *world = *UWorld::GWorld;
       printf("[DIAG] GWorld: %p, PersistentLevel: %p, AuthorityGameMode: %p\n",
@@ -10130,7 +10272,7 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
       }
     }
 
-    if (onHangarMap) {
+    if (onHangarMap && !g_serverMode) {  // offline-only hangar bring-up
       if (!g_genericPInitialised) {
         TArray<ULevelStreaming*>& streamingLevels = world->StreamingLevels;
         for (int i = 0; i < streamingLevels.Count(); ++i) {
@@ -10189,7 +10331,17 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
           TriggerLevelActorLinks();
         }
       }
-    } else {
+    } else if (!onHangarMap) {
+      // Fixed 2026-08-03: this was a plain `else`, so in server mode -- where
+      // the branch above is disabled by !g_serverMode -- it ran EVERY FRAME
+      // while standing in the hangar. It nulled g_customizationPreviewActor
+      // each tick, which is why the log shows 317 identical
+      // "CustomisationPreview actor updated ... (was 0000000000000000)" lines
+      // in a single hangar session: found, wiped, re-found, forever.
+      //
+      // The reset is about having LEFT the hangar map, so key it on that and
+      // nothing else. This deliberately does not enable any of the offline
+      // bring-up above in server mode.
       if (g_levelActorLinksAttempted) {
         printf("[ANIM-INIT] Resetting level actor links flags (left hangar map)\n");
         g_levelActorLinksAttempted = false;
@@ -10203,7 +10355,27 @@ void UGameEngineTick(UGameEngine *GameEngine, float DeltaTime,
   // ----------------------------------------------------
   // CAMERA FORCE / FADE OVERRIDE PASS (Runs every frame)
   // ----------------------------------------------------
-  if (!g_matchTravelIssued && *UWorld::GWorld) {
+  //
+  // Offline-only, and gated 2026-08-03 because this pass CRASHED the client.
+  // Captured stack, reading address 0x45e7b188:
+  //
+  //   Dreadnought.dll!CG::UObject::FindObjects<CG::ACameraActor>()
+  //                                          [SDK/CoreUObject_Classes.h:98]
+  //   Dreadnought.dll!UGameEngineTick()      [dllmain.cpp:10353]
+  //
+  // FindObjects walks the ENTIRE GObjects array and calls IsA on every entry.
+  // Doing that once per frame is already the most expensive thing the mod does,
+  // but the fatal part is that it is unsynchronised: during a match travel the
+  // async loader mutates GObjects from another thread, so the walk reads an
+  // entry that is being constructed or freed. Measured in the same run, the
+  // client's working set climbed 3.6 GB -> 7.5 GB in 86s (peak 2 GB in one 15s
+  // window) while the mod log grew only ~20 KB per 15s -- so the cost is real
+  // allocation on this path, not logging.
+  //
+  // Like TriggerLevelActorLinks and UnpauseHangarAnimations, forcing the hangar
+  // camera is offline bring-up: with a backend the server drives the view, and
+  // the one thing this pass reliably did against a live server was crash it.
+  if (!g_serverMode && !g_matchTravelIssued && *UWorld::GWorld) {
     UWorld *world = *UWorld::GWorld;
     if (world->OwningGameInstance &&
         world->OwningGameInstance->LocalPlayers.Count() > 0) {
@@ -10922,6 +11094,67 @@ static LONG WINAPI BackgroundThreadVEH(PEXCEPTION_POINTERS pExInfo) {
     }
   }
 
+  // ---- Instruction-fetch fault: the thread has jumped to garbage ----
+  //
+  // Handled here, ahead of the counting below, because the generic suppression
+  // at the bottom of this handler CANNOT work when RIP is not inside a module.
+  // That path decodes the faulting instruction to learn its length, and it
+  // deliberately refuses to read bytes outside the game module - so skipLen
+  // keeps its 4-byte default, RIP advances 4, and the next address is just as
+  // unmapped. It re-faults forever.
+  //
+  // Measured 2026-08-03 backing out to the main menu: one bad call marched RIP
+  // from 0x20 to 0xB4 in exact 4-byte steps, 50 suppressed AVs, then tripped
+  // the per-thread safety valve and ExitThread'd a thread whose name did not
+  // match the load-bearing list. The process died moments later. A single null
+  // function pointer became a dead thread and a crash.
+  //
+  // A jump to garbage arrives through `call [ptr]`, so the return address is
+  // still on the stack. Unwind to it and return 0 - exactly what the DEP branch
+  // above does. That branch does not fire here because an instruction fetch
+  // from an UNMAPPED page is reported as a read (ExceptionInformation[0] == 0),
+  // not as a DEP execute violation (8); DEP only covers pages that are mapped
+  // but not executable.
+  {
+    HMODULE ripHostMod = nullptr;
+    bool ripInModule =
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)rip, &ripHostMod) &&
+        ripHostMod != nullptr;
+    if (!ripInModule) {
+      uintptr_t rsp = pExInfo->ContextRecord->Rsp;
+      uintptr_t retAddr = 0;
+      if (rsp && IsReadableMemory((void *)rsp, sizeof(uintptr_t)))
+        retAddr = *(uintptr_t *)rsp;
+      HMODULE retMod = nullptr;
+      bool retOk = retAddr > 0x10000 &&
+                   GetModuleHandleExA(
+                       GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)retAddr, &retMod) &&
+                   retMod != nullptr;
+
+      static volatile LONG s_fetchLog = 0;
+      if (InterlockedIncrement(&s_fetchLog) <= 20)
+        printf("[VEH] instruction-fetch fault: rip=%p in no module, tid=%u -> "
+               "%s\n",
+               (void *)rip, currentThread,
+               retOk ? "unwound to caller, returning 0" : "unrecoverable");
+      if (retOk) {
+        pExInfo->ContextRecord->Rip = retAddr;
+        pExInfo->ContextRecord->Rsp = rsp + 8; // pop the return address
+        pExInfo->ContextRecord->Rax = 0;       // the call yields 0
+        return EXCEPTION_CONTINUE_EXECUTION;
+      }
+
+      // No usable return address, so resuming is impossible by any route.
+      // Fall through to the counting path ONLY to reach the existing kill
+      // logic, which knows not to destroy Render/RHI/Audio/Game threads. The
+      // march is what we are removing, not the safety valve.
+    }
+  }
+
   static volatile LONG totalCount = 0;
   LONG count = InterlockedIncrement(&totalCount);
 
@@ -11269,6 +11502,18 @@ static LONG WINAPI BackgroundThreadVEH(PEXCEPTION_POINTERS pExInfo) {
       skipLen = i;
     }
   }
+
+  // Only advance RIP when it points at a real instruction we just decoded.
+  // Outside the module the decode above is skipped and skipLen keeps its 4-byte
+  // default, which is not a guess about instruction length - it is a guess that
+  // there is an instruction there at all. When RIP has left every module that
+  // guess is always wrong, and stepping forward 4 bytes at a time through
+  // unmapped memory is what turned one bad call into 50 AVs and a killed thread
+  // (see the instruction-fetch block near the top of this handler). Anything
+  // recoverable was already handled there, so let the exception continue to the
+  // engine's own handler instead of manufacturing a fake resume point.
+  if (rip < modBase || rip >= modEnd)
+    return EXCEPTION_CONTINUE_SEARCH;
 
   pExInfo->ContextRecord->Rip += skipLen;
   return EXCEPTION_CONTINUE_EXECUTION;
@@ -12344,6 +12589,14 @@ void __fastcall MyHookGetLoadoutForShipID(void *lmc, int32_t shipID,
   if (lmc && IsWritableMemory((uint8_t *)lmc + 0x108, 12))
     entryCount = *(int32_t *)((uint8_t *)lmc + 0x110);
 
+  // Capped: every other diagnostic in this file caps, this one did not, and it
+  // is the hottest line in the log -- 710 of them in a single session, on a
+  // choke point every screen calls. The first 60 answer the only question it
+  // exists to answer (do the UI's and the manager's ID spaces overlap).
+  static volatile LONG s_lookupLog = 0;
+  if (InterlockedIncrement(&s_lookupLog) > 60)
+    return;
+
   if (effectiveID != shipID)
     tee_printf("[LOADOUTLOOKUP] shipID=%d -> key %d -> %d loadout(s) (manager "
                "holds %d entries)\n",
@@ -12386,6 +12639,168 @@ void __fastcall MyHookGetLoadoutForShipID(void *lmc, int32_t shipID,
 // That is what makes it safe to leave enabled once a real server starts
 // supplying one: this only ever fills a hole, it never overrides.
 static void *OrigGetLoadoutForSpawn = nullptr;
+
+// Host-side loadout source. DN_SERVER_LOADOUT=1 only.
+//
+// On the CLIENT the substitute loadout comes from hangar state
+// (g_lastActivatedLoadout / g_loadedShips). A battle server never runs a hangar,
+// so both are empty there and the substitution below falls through.
+//
+// The host can still get one, because the id it is looking for IS a cooked
+// asset it already ships. Verified from a host log:
+//
+//   FindLoadoutByID | Dind't find any loadouts matching id
+//                     Default__VH_AssaultMedium_T1_PrecastLoadout_BP_C
+//
+// which is the CDO of
+// /Game/Generic/Loadouts/Precast/T1/VH_AssaultMedium_T1_PrecastLoadout_BP.
+// These are the same four blueprints LoadInstallingLadouts would have installed
+// from m_installerLoadoutList, if it were reachable -- it is only ever called
+// behind InitializeFromPlayerData, which needs the YMmogbrain player data the
+// battle server never has because it never logs in.
+//
+// So: load the class, then find the CDO the load created. Cached because
+// StaticLoadClass pins to the root set and this is called per spawn.
+static const wchar_t *kHostPrecastLoadouts[] = {
+    L"/Game/Generic/Loadouts/Precast/T1/"
+    L"VH_AssaultMedium_T1_PrecastLoadout_BP.VH_AssaultMedium_T1_PrecastLoadout_"
+    L"BP_C",
+    L"/Game/Generic/Loadouts/Precast/T1/"
+    L"VH_DreadnoughtMedium_T1_PrecastLoadout_BP."
+    L"VH_DreadnoughtMedium_T1_PrecastLoadout_BP_C",
+    L"/Game/Generic/Loadouts/Precast/T1/"
+    L"VH_SniperMedium_T1_PrecastLoadout_BP.VH_SniperMedium_T1_PrecastLoadout_BP_"
+    L"C",
+    L"/Game/Generic/Loadouts/Precast/T1/"
+    L"VH_SupportMedium_T1_PrecastLoadout_BP."
+    L"VH_SupportMedium_T1_PrecastLoadout_BP_C",
+};
+static const char *kHostPrecastCDONames[] = {
+    "Default__VH_AssaultMedium_T1_PrecastLoadout_BP_C",
+    "Default__VH_DreadnoughtMedium_T1_PrecastLoadout_BP_C",
+    "Default__VH_SniperMedium_T1_PrecastLoadout_BP_C",
+    "Default__VH_SupportMedium_T1_PrecastLoadout_BP_C",
+};
+
+static UObject *g_hostPrecastLoadout = nullptr;
+static UObject *g_hostPrecastAll[4] = {};
+static int g_hostPrecastCount = 0;
+static bool g_hostPrecastAttempted = false;
+
+// Own function so the __try does not sit in a scope holding std::string, which
+// needs unwinding (MSVC C2712) -- same reason as ActivateLoadoutGuarded.
+static UObject *CreateDefaultObjectGuarded(UClass *cls) {
+  __try {
+    return cls->CreateDefaultObject();
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+
+static UObject *GetHostPrecastLoadout() {
+  if (g_hostPrecastAttempted)
+    return g_hostPrecastLoadout;
+  g_hostPrecastAttempted = true;
+
+  const int count =
+      (int)(sizeof(kHostPrecastLoadouts) / sizeof(kHostPrecastLoadouts[0]));
+  // Resolve ALL of them, not just the first. The first version stopped at the
+  // first success, so every player got the Assault Medium (Agosta) whatever
+  // they picked -- the other three ids kept failing FindLoadoutByID. Registering
+  // all four lets the engine's own lookup succeed for the chosen hull.
+  for (int i = 0; i < count; i++) {
+    // Take the class StaticLoadClass returns and ask IT for the CDO.
+    //
+    // The first attempt threw the return value away and searched by the short
+    // CDO name instead, which could never work: UObject::FindObject compares
+    // against GetFullName(), i.e. "ClassName Outer.Outer.Name", so a bare
+    // "Default__..._C" never matches anything. That is why all four reported
+    // "could not resolve" even before we knew whether the load itself worked.
+    UClass *cls = (UClass *)StaticLoadClass(UClass::StaticClass(), nullptr,
+                                            kHostPrecastLoadouts[i]);
+    // Find the CDO in GObjects by short name.
+    //
+    // UClass::CreateDefaultObject goes through a vtable index the SDK guesses
+    // (CREATE_DEFAULT_OBJECT_INDEX) and on this build it returned `this` -- the
+    // first attempt logged cls==cdo and then faulted inside ActivateLoadout,
+    // because the engine was handed a UClass where it wanted a loadout
+    // instance. Loading the class creates its CDO as a real object either way,
+    // so take it from the object table and explicitly reject the class itself.
+    UObject *cdo = nullptr;
+    std::string cdoClassName;
+    for (int32_t gi = 0; gi < UObject::GetGlobalObjects().Count(); ++gi) {
+      UObject *o = UObject::GetGlobalObjects().GetByIndex(gi);
+      if (!o || o == (UObject *)cls)
+        continue;
+      if (o->GetName() == kHostPrecastCDONames[i]) {
+        cdo = o;
+        if (o->Class)
+          cdoClassName = o->Class->GetName();
+        break;
+      }
+    }
+
+    if (cdo) {
+      HardenedPinToRootSet(cdo);
+      g_hostPrecastAll[g_hostPrecastCount++] = cdo;
+      if (!g_hostPrecastLoadout)
+        g_hostPrecastLoadout = cdo; // first one is the fallback
+      tee_printf("[SPAWN-HOST] precast loadout resolved: %s cls=%p cdo=%p "
+                 "cdoClass=%s\n",
+                 kHostPrecastCDONames[i], cls, cdo, cdoClassName.c_str());
+    } else {
+      tee_printf("[SPAWN-HOST] could not resolve %s (cls=%p, no distinct CDO "
+                 "in the object table)\n",
+                 kHostPrecastCDONames[i], cls);
+    }
+  }
+  if (!g_hostPrecastLoadout)
+    tee_printf("[SPAWN-HOST] no precast loadout could be loaded (tried %d)\n",
+               count);
+  else
+    tee_printf("[SPAWN-HOST] %d/%d precast loadouts resolved\n",
+               g_hostPrecastCount, count);
+  return g_hostPrecastLoadout;
+}
+
+// ADD ONLY -- deliberately not ActivateLoadout.
+//
+// The first version registered with ActivateLoadoutGuarded, which also
+// activates. Running that over all four in sequence left the LAST one active
+// (Support/Cerberus) and we then handed that back, so the player got Cerberus
+// no matter what they picked. Registering without activating leaves the engine's
+// own ServerSpawnNearActor free to look up and activate the chosen hull.
+static bool AddLoadoutOnlyGuarded(void *lmc, void *loadout) {
+  typedef void(__fastcall * tAddOnly)(void *, void *);
+  __try {
+    ((tAddOnly)(Globals::ModuleBase + 0x337450))(lmc, loadout);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+// Register every resolved precast loadout with the manager, so the engine's own
+// FindLoadoutByID succeeds for whichever hull the player picked rather than only
+// the one we happened to cache first.
+//
+// AddAndActivateLoadout records the entry with type 2, which matters: the
+// validity gate FUN_14033c680 rejects loadouts recorded as type 4.
+static void RegisterHostPrecastLoadouts(void *lmc) {
+  static void *s_registeredFor = nullptr;
+  if (!lmc || s_registeredFor == lmc)
+    return;
+  if (!GetHostPrecastLoadout())
+    return;
+  s_registeredFor = lmc;
+  for (int i = 0; i < g_hostPrecastCount; i++) {
+    if (!g_hostPrecastAll[i])
+      continue;
+    bool ok = AddLoadoutOnlyGuarded(lmc, g_hostPrecastAll[i]);
+    tee_printf("[SPAWN-HOST] register %s -> %s\n", kHostPrecastCDONames[i],
+               ok ? "ok" : "EXCEPTION");
+  }
+}
 
 // UYLoadoutManagerComponent::ActivateLoadout, verified entry 0x336C90.
 typedef void(__fastcall *tActivateLoadoutRaw)(void *lmc, void *loadout,
@@ -12514,6 +12929,21 @@ void *__fastcall MyHookGetLoadoutForSpawn(void *gameMode, void *pc) {
     for (int i = 0; i < g_numLoadedShips && !chosen; i++)
       chosen = g_loadedShips[i].loadoutObj;
   }
+  // Battle server: no hangar ever ran, so the two sources above are empty by
+  // construction. Fall back to the cooked precast assets. See
+  // GetHostPrecastLoadout.
+  //
+  // Register all four FIRST, so the engine's own ServerSpawnNearActor lookup
+  // can find the hull the player actually chose. Only if that still leaves us
+  // with nothing do we substitute one ourselves.
+  if (!chosen && g_serverMode) {
+    RegisterHostPrecastLoadouts(lmc);
+    void *active = nullptr;
+    if (IsWritableMemory((uint8_t *)lmc + 0x208, 8))
+      active = *(void **)((uint8_t *)lmc + 0x208);
+    chosen = active ? (UObject *)active : GetHostPrecastLoadout();
+  }
+
   if (!chosen) {
     tee_printf("[SPAWN] no loadout available to substitute (loadedShips=%d)\n",
                g_numLoadedShips);
@@ -12821,6 +13251,56 @@ void InitEarlyHooks() {
       } else {
         tee_printf("[HOOK] WARNING: failed to hook GetLoadoutForSpawn at RVA "
                    "0x370970\n");
+      }
+    }
+
+    // ---- OTS slice size: stop the client killing its own battle server ----
+    //
+    // UYLocalServerDataManager replicates tune data to the host in fixed slices
+    // of 900 rows (stride 0x40). The last slice measures ~69.6 KB, and UE4.13
+    // caps a reassembled partial bunch at exactly 64 KB
+    // (0x19091A0: (NumBits + 7) & ~7 < 0x80001). There is no
+    // NetMaxConstructedPartialBunchSizeBytes cvar in this engine version, so the
+    // cap cannot be raised. The host rejects the bunch and then dies:
+    //
+    //   LogNetPartialBunch:Error: Final partial bunch too large
+    //   UChannel::ReceivedRawBunch: Bunch.IsError() after ReceivedNextBunch 1
+    //   Received corrupted packet data from client 127.0.0.1.  Disconnecting.
+    //   Unhandled Exception: EXCEPTION_STACK_OVERFLOW
+    //
+    // Captured from a live battle server 2026-08-03; those four lines are
+    // consecutive. Every matchmade host died this way at 54-59s, which is when
+    // the slices finish arriving, not a timeout.
+    //
+    // The slice size is an imm32 in "add ebp, 900" at RVA 0x57B2A7. Shrinking it
+    // keeps every bunch well under the cap; the loop clamps to the row count
+    // (cmovg ebp, [rbx+8]) so a smaller stride is just more, smaller slices.
+    // 600 gives ~46 KB with margin. DN_OTS_ROWS overrides, 0 disables.
+    if (BisectGetEnv("DN_NO_PATCHES") != "1") {
+      std::string rowsEnv = BisectGetEnv("DN_OTS_ROWS");
+      uint32_t rows = rowsEnv.empty() ? 600u : (uint32_t)atoi(rowsEnv.c_str());
+      if (rows > 0) {
+        uintptr_t immAddr = Globals::ModuleBase + 0x57B2A9;
+        DWORD oldProt;
+        if (VirtualProtect((void *)immAddr, 4, PAGE_EXECUTE_READWRITE,
+                           &oldProt)) {
+          uint32_t before = *(uint32_t *)immAddr;
+          if (before == 900) {
+            *(uint32_t *)immAddr = rows;
+            VirtualProtect((void *)immAddr, 4, oldProt, &oldProt);
+            tee_printf("[PATCH] OTS slice rows 900 -> %u at RVA 0x57B2A9 "
+                       "(keeps partial bunches under UE4.13's 64 KB cap)\n",
+                       rows);
+          } else {
+            VirtualProtect((void *)immAddr, 4, oldProt, &oldProt);
+            tee_printf("[PATCH] WARNING: OTS slice imm at 0x57B2A9 was %u, "
+                       "expected 900 - NOT patched\n",
+                       before);
+          }
+        } else {
+          tee_printf("[PATCH] WARNING: VirtualProtect failed for OTS slice "
+                     "imm at RVA 0x57B2A9\n");
+        }
       }
     }
 
@@ -13386,16 +13866,45 @@ void InitEarlyHooks() {
   // REMOVED - GC patch now runs ONLY in InitEarlyHooks (line ~3984)
   // Duplicate call was causing memory corruption by NOPping unrelated CALLs
 
-  // MallocBinned Free Hook to prevent crashes on invalid/mismatched frees
-  uintptr_t freeAddr = Globals::ModuleBase + 0xBFCA40;
-  MH_STATUS freeStatus = MH_CreateHookGated(
-      (LPVOID)freeAddr, reinterpret_cast<LPVOID>(MyHookFMallocBinnedFree),
-      reinterpret_cast<void **>(&OrigFMallocBinnedFree));
-  if (freeStatus == MH_OK) {
-    MH_EnableHook((LPVOID)freeAddr);
-    printf("[HOOK] FMallocBinned::Free hook installed at RVA 0xBFCA40\n");
+  // MallocBinned Free Hook to prevent crashes on invalid/mismatched frees.
+  //
+  // SERVER MODE: NOT INSTALLED. This hook is the 40 MB/s leak.
+  // MyHookFMallocBinnedFree returns without calling the original whenever
+  // IsValidBinnedPtr says no -- and that function returns false on *failure to
+  // confirm*, not only on corruption: it has an __except catch-all, a
+  // fallthrough when foundPage is never set, and it only walks pooled small
+  // blocks, so large allocations can never be found. Every swallowed free
+  // leaks that block permanently.
+  //
+  // Measured 2026-08-03 against the live revival server, same build, same
+  // hangar, one variable:
+  //
+  //   all 39 RVA hooks        hangar +31 MB/s, match +40.7 MB/s (peak 14.2 GB)
+  //   DN_RVA_OFF=0xBFCA40     hangar   0.0 MB/s (priv identical x20 samples)
+  //   DN_INERT=1              hangar   0.0 MB/s
+  //
+  // The guard was offline bring-up scaffolding: it papered over mismatched
+  // frees caused by the mod's own fabricated item cache / tech tree / fleet
+  // state, which the real server now supplies properly. Offline keeps it.
+  //
+  // If it ever has to come back in server mode, invert the default -- call the
+  // original free unless there is positive evidence of corruption, rather than
+  // skipping whenever confirmation fails.
+  if (g_serverMode) {
+    printf("[HOOK] FMallocBinned::Free hook SKIPPED in server mode "
+           "(it swallows unconfirmed frees - measured 31-40 MB/s leak)\n");
   } else {
-    printf("[HOOK] WARNING: FMallocBinned::Free hook failed: %d\n", freeStatus);
+    uintptr_t freeAddr = Globals::ModuleBase + 0xBFCA40;
+    MH_STATUS freeStatus = MH_CreateHookGated(
+        (LPVOID)freeAddr, reinterpret_cast<LPVOID>(MyHookFMallocBinnedFree),
+        reinterpret_cast<void **>(&OrigFMallocBinnedFree));
+    if (freeStatus == MH_OK) {
+      MH_EnableHook((LPVOID)freeAddr);
+      printf("[HOOK] FMallocBinned::Free hook installed at RVA 0xBFCA40\n");
+    } else {
+      printf("[HOOK] WARNING: FMallocBinned::Free hook failed: %d\n",
+             freeStatus);
+    }
   }
 }
 
@@ -13789,8 +14298,84 @@ void MainThread() {
     bool isBattleServer = cmd.find(L"-matchid=") != std::wstring::npos;
     if (isBattleServer) {
       g_serverMode = true;
-      printf("[INIT] Battle server detected (-MatchID on the command line) - "
-             "mod standing down so it hosts the map it was given.\n");
+
+      // OPT-IN host loadout fix. Everything else above still stands down.
+      //
+      // The host's loadout manager is empty because it never logs in, so
+      // AYGameMode::SpawnDefaultPawn finds no active loadout and no pawn is
+      // ever created -- the player sits on the orbit camera watching the
+      // planet. See GetHostPrecastLoadout for the full chain.
+      //
+      // This installs ONE hook (0x370970) and nothing else. In particular it
+      // does NOT run the offline bring-up, the mock gateway, or gwog's
+      // ServerStartCallbacks -- that last one is what used to ServerTravel the
+      // host to DansMap instead of the map it was told to host.
+      //
+      // The switch is a MARKER FILE. Drop an empty dn_server_loadout.txt next to
+      // the executable to enable, delete it to disable -- no rebuild either way.
+      // DN_SERVER_LOADOUT=1 is also honoured.
+      //
+      // CORRECTED 2026-08-03 (darkace, AGENT-CHAT S10.5). We first wrote that
+      // the spawner launches the host with a "clean environment". It does not:
+      // dn-dedicated/internal/server/instance.go buildEnv starts from
+      // os.Environ() and only appends, and game-manager/spawner/spawner.go does
+      // the same. The host inherits DN-DEDICATED'S environment. DN_INERT set in
+      // a client's shell never reaches a host because the host is spawned from a
+      // different process tree, not because anything scrubs it -- export it for
+      // the dn-dedicated service and it does reach every host that service
+      // spawns.
+      //
+      // The marker file is still the right switch: it survives however the
+      // operator starts the service and needs no restart. Only the reasoning
+      // above was wrong, and a wrong mechanism costs a session later.
+      bool hostLoadoutEnabled = false;
+      {
+        char b[8];
+        DWORD n = GetEnvironmentVariableA("DN_SERVER_LOADOUT", b, sizeof(b));
+        if (n == 1 && b[0] == '1')
+          hostLoadoutEnabled = true;
+      }
+      if (!hostLoadoutEnabled) {
+        char markerPath[MAX_PATH];
+        GetModuleFileNameA(NULL, markerPath, MAX_PATH);
+        char *slash = strrchr(markerPath, '\\');
+        if (slash)
+          strcpy(slash + 1, "dn_server_loadout.txt");
+        if (GetFileAttributesA(markerPath) != INVALID_FILE_ATTRIBUTES)
+          hostLoadoutEnabled = true;
+      }
+
+      if (!hostLoadoutEnabled) {
+        printf("[INIT] Battle server detected (-MatchID on the command line) - "
+               "mod standing down so it hosts the map it was given.\n");
+        return;
+      }
+
+      printf("[INIT] Battle server detected - standing down EXCEPT the host "
+             "loadout fix (dn_server_loadout.txt / DN_SERVER_LOADOUT=1).\n");
+
+      // Init steps 3 and 4 only, matching the DN_INIT_MAX ladder below.
+      // InitSdk gives GObjects/GNames (UObject::FindObject needs them) and
+      // ScanAll resolves StaticLoadClass. Step 5, InitEarlyHooks, is the whole
+      // offline hook set and is deliberately NOT reached.
+      InitSdk();
+      Scanner::ScanAll();
+
+      if (MH_Initialize() != MH_OK) {
+        printf("[INIT] host loadout fix: MH_Initialize failed, standing down "
+               "fully.\n");
+        return;
+      }
+
+      uintptr_t spawnLoadoutAddr = Globals::ModuleBase + 0x370970;
+      if (MH_CreateHook((LPVOID)spawnLoadoutAddr, &MyHookGetLoadoutForSpawn,
+                        &OrigGetLoadoutForSpawn) == MH_OK &&
+          MH_EnableHook((LPVOID)spawnLoadoutAddr) == MH_OK) {
+        printf("[INIT] host loadout fix: hooked GetLoadoutForSpawn at "
+               "0x370970.\n");
+      } else {
+        printf("[INIT] host loadout fix: FAILED to hook 0x370970.\n");
+      }
       return;
     }
   }
