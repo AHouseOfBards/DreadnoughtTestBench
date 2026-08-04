@@ -12792,6 +12792,58 @@ static UObject *GetHostPrecastLoadout() {
 // This hook calls the original first and changes nothing.
 static void *OrigOrbitTeleportPlayer = nullptr;
 
+// Which pawn does this player have, and WHICH LEVEL does that pawn live in?
+//
+// Added 2026-08-04 to test the strongest explanation we have for the in-match
+// symptoms. The host timeline says the human player never receives an arena
+// pawn at all:
+//
+//   03.27.59  SpawnDefaultPawn player 257     <- during ship select
+//   03.29.28  TeleportPlayersFromOrbit + our forced inOrbit=1
+//   03.29.29  SpawnDefaultPawn player 256     <- only 256 gets a NEW pawn
+//   03.29.31  ActivateLevel MP_Highlands_INTRO   0 0 0   <- DEACTIVATED
+//   03.29.31  ActivateLevel MP_Highlands_INTRO02 0 0 0   <- DEACTIVATED
+//   03.29.33  BeginBattle
+//
+// 256 had no pawn when the teleport ran, so it got one. 257 already had the
+// ship-select pawn, so the engine kept it - and two seconds later the streaming
+// level that pawn belongs to is unloaded. The client says exactly that at spawn
+// time: "AYLevelScriptActor::CallOnPlayerSpawned: Pawn does not belong to a
+// world."
+//
+// If true it explains, from one cause: thruster and muzzle effects missing
+// (attached to a pawn in a dead level) while impact effects render (spawned
+// into the persistent world), movement that tumbles and rubber-bands while the
+// game itself is smooth, and the "second motionless me" seen earlier.
+//
+// AYPlayerController::Pawn is at +0x3C8 - the same offset MyHookSpawnDefaultPawn
+// already reads. GetFullName() prints "Class Outer.Outer.Name", and an Actor's
+// outer IS its ULevel, so the level name falls out of the name itself. Logged
+// before AND after the original call, because "did the teleport replace the
+// pawn?" is the actual question.
+static void ReportOrbitPawn(const char *when, void *player) {
+  if (!player || !IsReadableMemory((uint8_t *)player + 0x3C8, 8)) {
+    tee_printf("[ORBIT-PAWN] %-6s player=%p (Pawn field unreadable)\n", when,
+               player);
+    return;
+  }
+  void *pawn = *(void **)((uint8_t *)player + 0x3C8);
+  if (!pawn) {
+    tee_printf("[ORBIT-PAWN] %-6s player=%p pawn=NULL\n", when, player);
+    return;
+  }
+  std::string full = "(GetFullName threw)";
+  try {
+    full = ((UObject *)pawn)->GetFullName();
+  } catch (...) {
+  }
+  const char *flag = "";
+  if (full.find("INTRO") != std::string::npos)
+    flag = "  <== pawn lives in an INTRO streaming level";
+  tee_printf("[ORBIT-PAWN] %-6s player=%p pawn=%p %s%s\n", when, player, pawn,
+             full.c_str(), flag);
+}
+
 void __fastcall MyHookOrbitTeleportPlayer(void *self, void *player) {
   static volatile LONG s_probes = 0;
   // The LOGGING is capped; the force below must not be, or it would stop
@@ -12828,9 +12880,17 @@ void __fastcall MyHookOrbitTeleportPlayer(void *self, void *player) {
       tee_printf("[ORBIT-PROBE] player=%p NOT READABLE at +0x940\n", player);
     }
   }
+  if (verbose)
+    ReportOrbitPawn("BEFORE", player);
+
   typedef void(__fastcall * OrigFn)(void *, void *);
   if (OrigOrbitTeleportPlayer)
     ((OrigFn)OrigOrbitTeleportPlayer)(self, player);
+
+  // The whole point: did the real teleport hand this player a DIFFERENT pawn,
+  // or is it still carrying the ship-select one out of the INTRO level?
+  if (verbose)
+    ReportOrbitPawn("AFTER", player);
 }
 
 // Genuinely add-only. Verified .pdata entry 0x3382F0-0x338330; signature
@@ -12958,6 +13018,79 @@ static void DumpManagerLoadoutIds(void *mgr, uint64_t want) {
 // lookup that succeeded -- this only ever fills the hole, which is what makes it
 // safe to leave enabled once a real backend starts populating the manager.
 static void *OrigFindLoadoutByID = nullptr;
+
+// AYPlayerController::UpdateWeaponSettings, verified .pdata primary entry
+// 0x5A4600 (the "Invalid active weapon" literal lives in its cold chunk
+// 0x5A4666-0x5A46BE, so the log line alone would not have told us the function
+// ran - it only proves the failure path ran).
+//
+// CLIENT-side probe for the missing weapon VFX. The client logs, at the exact
+// moment the pawn appears in a match:
+//
+//   AYLevelScriptActor::CallOnPlayerSpawned: Pawn does not belong to a world.
+//   AYPlayerController::UpdateWeaponSettings Invalid active weapon
+//
+// The second one is reached like this:
+//
+//   0x5A4609  add  rcx, 0xbb0        ; weak ptr to the pawn
+//   0x5A4610  call 0xD6AD50          ; resolve it
+//   0x5A4615  mov  rcx, [rax+0x868]  ; the weapon container
+//   0x5A461F  jne  0x5A4666          ; container non-null -> continue
+//   0x5A466B  call 0x53EB60          ; GetActiveWeapon
+//   0x5A4676  jne  0x5A46BE          ; non-null -> do the real work
+//                                    ; null -> "Invalid active weapon", return
+//
+// and 0x53EB60 (a leaf stub, no unwind record - expected, not an error) returns
+// null in exactly two cases:
+//
+//   movsxd rax, [rcx+0x1a0]   ; activeIndex
+//   cmp    eax, [rcx+0x1d0]   ; count        -> jge  return null
+//   mov    rax, [rcx+0x1c8]   ; array
+//   cmp    qword [rax+rdx*8], 0             -> je   return null
+//
+// So: the weapons array is empty, or the active index is out of range. Those
+// two have completely different causes - the first means the weapons never
+// reached the client at all, the second means they are there but nothing
+// selected one - and this probe says which. Ruled out already: the client calls
+// FindLoadoutByID only at login, never in-match, so it does NOT get the pawn
+// loadout through the loadout manager.
+static void *OrigUpdateWeaponSettings = nullptr;
+
+void __fastcall MyHookUpdateWeaponSettings(void *pc) {
+  typedef void(__fastcall * OrigFn)(void *);
+  if (OrigUpdateWeaponSettings)
+    ((OrigFn)OrigUpdateWeaponSettings)(pc);
+
+  static int s_n = 0;
+  if (!pc || s_n++ >= 12)
+    return;
+
+  typedef void *(__fastcall * tResolveWeak)(void *);
+  void *pawn =
+      ((tResolveWeak)(Globals::ModuleBase + 0xD6AD50))((uint8_t *)pc + 0xbb0);
+  if (!pawn || !IsReadableMemory((uint8_t *)pawn + 0x868, 8)) {
+    tee_printf("[WEAPON] UpdateWeaponSettings pc=%p pawn=%p (no pawn)\n", pc,
+               pawn);
+    return;
+  }
+  void *cont = *(void **)((uint8_t *)pawn + 0x868);
+  if (!cont || !IsReadableMemory((uint8_t *)cont + 0x1a0, 0x40)) {
+    tee_printf("[WEAPON] pc=%p pawn=%p container=%p (null or unreadable)\n", pc,
+               pawn, cont);
+    return;
+  }
+  int32_t activeIdx = *(int32_t *)((uint8_t *)cont + 0x1a0);
+  int32_t count = *(int32_t *)((uint8_t *)cont + 0x1d0);
+  void *arr = *(void **)((uint8_t *)cont + 0x1c8);
+  const char *verdict =
+      (count <= 0) ? "  <== ARRAY EMPTY: weapons never reached the client"
+      : (activeIdx < 0 || activeIdx >= count)
+          ? "  <== INDEX OUT OF RANGE: weapons exist, none selected"
+          : "";
+  tee_printf("[WEAPON] pc=%p pawn=%p container=%p activeIndex=%d count=%d "
+             "arr=%p%s\n",
+             pc, pawn, cont, activeIdx, count, arr, verdict);
+}
 
 // HUD SetEnergyWheelSelection, verified .pdata entry 0x551010-0x55108F, reached
 // through its single caller 0x587788.
@@ -13186,11 +13319,53 @@ void *__fastcall MyHookGetLoadoutForSpawn(void *gameMode, void *pc) {
     void *active = nullptr;
     if (IsWritableMemory((uint8_t *)lmc + 0x208, 8))
       active = *(void **)((uint8_t *)lmc + 0x208);
-    chosen = active ? (UObject *)active : GetHostPrecastLoadout();
-    if (verbose)
-      tee_printf("[SPAWN] host fallback: activeLoadout=%p chosen=%p (%s)\n",
-                 active, (void *)chosen,
-                 active ? "engine's own" : "arbitrary default, choice was lost");
+
+    // NO ARBITRARY DEFAULT. Changed 2026-08-04, and the change is a REMOVAL.
+    //
+    // This used to fall back to GetHostPrecastLoadout() - the first entry in
+    // the precast array - whenever nothing else produced a loadout. That is
+    // what put a second, motionless Agosta on the map, and it took us two
+    // wrong diagnoses to see why.
+    //
+    // A listen server holds a player slot of its own. In a live match the
+    // human is player 257 and the host's own local player is 256, and 256 has
+    // no human, no player record and no choice to lose:
+    //
+    //   257  [LOADOUT-ID] miss -> FOUND            (engine resolved the Agosta)
+    //   256  [SPAWN] no loadout from engine
+    //        host fallback: chosen=... arbitrary default
+    //        SpawnDefaultPawn | Spawning a pawn for player 256
+    //
+    // So we were handing a ship to a player that is not meant to fly one, and
+    // it looked like a duplicate of the human's ship purely because the first
+    // precast in the array is the Assault Medium. Before any of the loadout
+    // work, 256 simply failed to spawn - which was correct behaviour.
+    //
+    // We retracted the earlier explanation of this to darkace in C26: it is not
+    // an orphaned orbit pawn that our forced teleport failed to clean up.
+    //
+    // A real player never reaches here any more - MyHookFindLoadoutByID
+    // resolves their own id at the earlier ServerSpawnNearActor lookup, which
+    // is why 257 above shows FOUND and never appears in this branch. So the
+    // only thing this default was still doing was creating the phantom.
+    //
+    // m_activeLoadout is still honoured: if anything upstream genuinely
+    // activated one, it knows more than we do. Only the invented default goes.
+    // DN_HOST_DEFAULT_LOADOUT=1 restores the old behaviour.
+    if (!active && BisectGetEnv("DN_HOST_DEFAULT_LOADOUT") == "1") {
+      chosen = GetHostPrecastLoadout();
+      if (verbose)
+        tee_printf("[SPAWN] host fallback: arbitrary default RE-ENABLED by "
+                   "DN_HOST_DEFAULT_LOADOUT=1 -> %p\n",
+                   (void *)chosen);
+    } else {
+      chosen = (UObject *)active;
+      if (verbose)
+        tee_printf(
+            "[SPAWN] host fallback: activeLoadout=%p -> %s\n", active,
+            active ? "using the engine's own active loadout"
+                   : "NO substitute (a player with no choice does not fly)");
+    }
   }
 
   if (!chosen) {
@@ -14076,6 +14251,13 @@ void InitEarlyHooks() {
   MH_CreateHookGated((void *)(Globals::ModuleBase + 0x340340), GetShipByIdHook,
                 &OrigGetShipById);
   MH_EnableHook((void *)(Globals::ModuleBase + 0x340340));
+
+  // Read-only weapon probe. See MyHookUpdateWeaponSettings.
+  if (BisectGetEnv("DN_NO_WEAPON_PROBE") != "1") {
+    MH_CreateHookGated((void *)(Globals::ModuleBase + 0x5A4600),
+                       MyHookUpdateWeaponSettings, &OrigUpdateWeaponSettings);
+    MH_EnableHook((void *)(Globals::ModuleBase + 0x5A4600));
+  }
 
   // Read-only energy wheel probe. See MyHookHudSetEnergyWheelSelection.
   if (BisectGetEnv("DN_NO_EWHEEL_PROBE") != "1") {
